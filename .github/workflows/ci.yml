@@ -29,17 +29,11 @@ jobs:
   # The job must be named `test`: that is the required status check.
   test:
     runs-on: ubuntu-22.04
-    # The driver targets ROS 2 Humble. The image supplies the ROS 2 libraries
-    # and the ament build type, so nothing has to be installed from a ROS
-    # package index at run time.
+    # The driver targets ROS 2 Humble. The base image supplies the ROS 2
+    # libraries and the ament build type; ros2_control is not part of it and
+    # comes in through rosdep below.
     container: ros:humble-ros-base
     steps:
-      - name: Install Build Tools
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            git build-essential python3-colcon-common-extensions
-
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
@@ -51,10 +45,25 @@ jobs:
           repository: nexform-tech/litegrip-cpp
           path: ws/src/litegrip-cpp
 
-      - name: Build
+      # Dependencies come from the manifests rather than a hand-written list,
+      # so a new one cannot be forgotten here.
+      - name: Install Dependencies
         shell: bash
         run: |
           # ROS's setup scripts are not nounset-clean, so -u stays off here.
+          set -eo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential python3-colcon-common-extensions python3-rosdep
+          rosdep init 2>/dev/null || true
+          rosdep update
+          source /opt/ros/humble/setup.bash
+          cd ws
+          rosdep install --from-paths src --ignore-src -y
+
+      - name: Build
+        shell: bash
+        run: |
           set -eo pipefail
           source /opt/ros/humble/setup.bash
           cd ws
@@ -66,7 +75,6 @@ jobs:
       - name: Run Tests
         shell: bash
         run: |
-          # ROS's setup scripts are not nounset-clean, so -u stays off here.
           set -eo pipefail
           source /opt/ros/humble/setup.bash
           cd ws
