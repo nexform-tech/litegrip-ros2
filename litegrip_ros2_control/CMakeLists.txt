@@ -45,6 +45,18 @@ ament_target_dependencies(litegrip_ros2_control
   rclcpp_lifecycle
 )
 
+# Where litegrip_cpp installed its calibration / safety-baseline files.
+#
+# The SDK resolves its data at run time and deliberately bakes in no
+# machine-dependent path, so a version name like "3.5" only resolves relative to
+# the working directory unless LITEGRIP_DATA_DIR is set. A controller_manager is
+# started from wherever the user happened to be, so the component sets that
+# variable from this build-time value when the environment does not already
+# provide one (precedence: explicit path > environment > this default).
+target_compile_definitions(litegrip_ros2_control PRIVATE
+  LITEGRIP_DEFAULT_DATA_DIR="${litegrip_cpp_DATA_DIR}"
+)
+
 pluginlib_export_plugin_description_file(hardware_interface litegrip_ros2_control.xml)
 
 # ─────────────────────────────────────────────────────────────────────────────

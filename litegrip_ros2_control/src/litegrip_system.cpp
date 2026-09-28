@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -25,11 +26,43 @@
 #include <litegrip/constants.hpp>
 #include <litegrip/exceptions.hpp>
 
+#ifndef LITEGRIP_DEFAULT_DATA_DIR
+#define LITEGRIP_DEFAULT_DATA_DIR ""
+#endif
+
 namespace litegrip_ros2_control {
 namespace {
 
 /** Log throttle period (seconds). */
 constexpr double kLogThrottleS = 5.0;
+
+/**
+ * Make the SDK's data files findable regardless of the process working
+ * directory.
+ *
+ * The SDK resolves its calibration and safety-baseline files at run time and
+ * deliberately has no machine-dependent path compiled in, so a bare version name
+ * like "3.5" is searched for relative to the working directory. A
+ * controller_manager, however, is started from wherever the user happened to be
+ * standing, which makes that search fail — and a missing safety baseline is
+ * fail-closed, so the component refuses to start.
+ *
+ * Precedence, strongest first:
+ *   1. an explicit path in the safety_baseline parameter (handled by the SDK),
+ *   2. LITEGRIP_DATA_DIR already in the environment (the deployment's choice),
+ *   3. the directory litegrip_cpp was installed into, recorded at build time.
+ *
+ * setenv(..., overwrite=0) so an operator's value is never clobbered.
+ */
+void ensure_sdk_data_dir_known() {
+  if (std::getenv("LITEGRIP_DATA_DIR") != nullptr) {
+    return;
+  }
+  if (LITEGRIP_DEFAULT_DATA_DIR[0] == '\0') {
+    return;
+  }
+  ::setenv("LITEGRIP_DATA_DIR", LITEGRIP_DEFAULT_DATA_DIR, 0);
+}
 
 std::string param_or(const hardware_interface::HardwareInfo &info,
                      const std::string &key, const std::string &fallback) {
@@ -151,6 +184,11 @@ hardware_interface::CallbackReturn LitegripSystem::on_init(
       hardware_interface::CallbackReturn::SUCCESS) {
     return hardware_interface::CallbackReturn::ERROR;
   }
+
+  // Do this before anything can try to load a safety baseline: the baseline is
+  // looked up by version name, and the working directory is not a reliable place
+  // to find it from.
+  ensure_sdk_data_dir_known();
 
   litegrip::ControlLoopConfig config;
   try {
