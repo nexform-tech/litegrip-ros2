@@ -6,7 +6,7 @@ ROS 2 driver for the **LiteGrip lightweight robotic gripper series**.
 
 | Package | Type | Role |
 | --- | --- | --- |
-| `litegrip_ros2_control` | ament_cmake | `ros2_control` hardware interface: a C++ `SystemInterface` plugin exchanging state and command blocks with a Python hardware daemon over POSIX shared memory; the daemon owns the CAN device and the vendor SDK and enforces the safety gate |
+| `litegrip_ros2_control` | ament_cmake | `ros2_control` hardware interface: a C++ `SystemInterface` plugin backed directly by the [litegrip-cpp](https://github.com/nexform-tech/litegrip-cpp) SDK. A thin shell — the SDK's `ControlLoop` owns the CAN device, the trajectory rate ceiling, the torque budget, the red-line safety gate and the DM MIT frame stream, on its own thread |
 
 ## Scope
 
@@ -14,7 +14,7 @@ ROS 2 driver for the **LiteGrip lightweight robotic gripper series**.
 | --- | --- |
 | Product | LiteGrip lightweight robotic gripper series |
 | Repository role | ROS 2 driver |
-| Status | Active — ros2_control hardware interface landed |
+| Status | Active — ros2_control hardware interface backed by the C++ SDK (no Python daemon, no shared memory) |
 
 ## Related repositories
 

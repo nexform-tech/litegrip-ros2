@@ -1,77 +1,62 @@
-# litegrip_controllers.yaml — the gripper controller declaration (shares the same
-# controller_manager as the arm).
+# litegrip_controllers.yaml — the gripper controller declaration (shares the
+# same controller_manager as the arm).
 #
-# Loaded by litearm_control.launch.py as an **extra params file** (alongside
-# litearm_ros2_control/config/litearm_controllers.yaml). Two separate files keep the
-# gripper's controller configuration in the gripper's own package — the arm side
-# needs to know nothing about the gripper.
+# Loaded by the arm's control launch as an **extra params file** (alongside
+# litearm_ros2_control/config/litearm_controllers.yaml). Two separate files keep
+# the gripper's controller configuration in the gripper's own package — the arm
+# side needs to know nothing about the gripper.
 #
 # ⚠ Dependency: what this file declares are controllers **on top of the hardware
-#   interface**, so the hardware component in urdf/litegrip.ros2_control.xacro must
-#   already have been loaded (i.e. the description file has to include it),
+#   interface**, so the hardware component in urdf/litegrip.ros2_control.xacro
+#   must already have been loaded (i.e. the description file has to include it),
 #   otherwise the spawner will not find gripper_opening_joint's interfaces.
 
 controller_manager:
   ros__parameters:
-    # ★ The name is deliberately gripper_controller: the MoveIt side's
-    #   litearm_manipulation/config/moveit_controllers.yaml already has a
-    #   controller with the same name (type: FollowJointTrajectory,
-    #   action_ns: follow_joint_trajectory). ros2_control's JTC happens to offer an
-    #   action with the same name on <name>/follow_joint_trajectory, so using it
-    #   to take over the action server that real_gripper_node used to provide
-    #   means **not one line** on the MoveIt side has to change.
+    # ★ GripperActionController, not a JointTrajectoryController.
+    #
+    #   This is a gripper, and its normal ending is "close until contact and
+    #   stop" — while grasping it gets stuck on the object and never reaches the
+    #   commanded opening. Under a JTC that ending had to be rescued with
+    #   goal_time: 0.0 (no timeout judgement at all), which is a blunt trade: it
+    #   gives up trajectory monitoring for everything. GripperActionController
+    #   expresses the same intent directly, with stall and goal tolerance
+    #   criteria that mean what they say.
+    #
+    #   The action it provides is control_msgs/action/GripperCommand on
+    #   <name>/gripper_cmd, NOT FollowJointTrajectory on
+    #   <name>/follow_joint_trajectory. That is an externally visible change:
+    #   anything hard-wired to the old action name must be updated.
     gripper_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
+      type: position_controllers/GripperActionController
 
 gripper_controller:
   ros__parameters:
     # The master joint only. The two fingers are its <mimic> and have no
     # independent command port.
-    joints: [gripper_opening_joint]
+    joint: gripper_opening_joint
 
-    # Command is position only (the hardware interface exports exactly that one,
-    # see litegrip.ros2_control.xacro). Wanting velocity/torque feedforward means
-    # changing the hardware interface first — those two are not a "per-command"
-    # concept on this gripper (the rate ceiling and the torque budget are both
-    # daemon parameters).
-    command_interfaces: [position]
-    # ⚠ effort must **not** be written here: Humble's JTC accepts only
-    #   {position, velocity, acceleration} as state_interfaces (writing effort
-    #   throws "Entry 'effort' ... is not in the set" at load time). The hardware
-    #   interface exports effort **as usual** — joint_state_broadcaster publishes
-    #   it to /joint_states, JTC simply does not need it. That is, "feedback with
-    #   position/velocity/torque like any other joint" is guaranteed by the
-    #   hardware interface + JSB, independently of JTC.
-    state_interfaces: [position, velocity]
+    # How often the controller checks whether the goal was reached.
+    action_monitor_rate: 20.0
 
-    allow_partial_joints_goal: false
-    open_loop_control: false
+    # Trajectory/goal tolerance in metres. The opening range is only ~0.087 m,
+    # so these are two orders of magnitude smaller than the arm's radian
+    # tolerances: 8 mm is wide enough to tolerate the steady-state droop that
+    # calibration and elasticity bring, and tight enough that "did not get
+    # there" is not taken for "got there".
+    goal_tolerance: 0.008
 
-    constraints:
-      # ★★ stopped_velocity_tolerance must be **greater** than the quantization
-      #    floor of the feedback velocity. dq in the motor feedback frame is a
-      #    12-bit field (range ±30 rad/s), one LSB is ≈0.0147 rad/s, and **no code
-      #    in those 12 bits represents 0 exactly** — the closest code decodes to
-      #    −0.0073260 rad/s. Converted to opening velocity (× 65.0231 mm/rad ×
-      #    1e-3) that is about 4.8e-4 m/s, i.e. **as long as feedback is alive the
-      #    velocity is not 0 even when the gripper is standing still**. 0.002 m/s
-      #    leaves a 4x margin: any tighter and "it really stopped" would be judged
-      #    as "still moving".
-      stopped_velocity_tolerance: 0.002
-      # ★★ goal_time of 0.0 = **no timeout judgement**.
-      #    One of this gripper's normal endings is "close until contact and stop"
-      #    (while grasping it gets stuck on the object and never reaches the
-      #    commanded opening), and that is not a failure. JTC's goal_time
-      #    criterion would abort that normal ending as a timeout. The real grasp
-      #    semantics (stall + rising torque = grasped / stall without torque =
-      #    jammed) belong in grasp detection on the layer above (the old driver's
-      #    GraspDetector did exactly that), not in JTC's tolerances.
-      goal_time: 0.0
-      # Trajectory tracking tolerance: the opening range is only 0~0.087 m, so
-      # these numbers are two orders of magnitude smaller than the arm's
-      # (0.25~0.35 rad). 8 mm: wide enough to tolerate the steady-state droop
-      # that calibration/elasticity bring, and tight enough that "did not get
-      # there" is not taken for "got there".
-      # ⚠ What it constrains is **trajectory tracking** (during the motion),
-      # which means something different from goal_time above.
-      gripper_opening_joint: {trajectory: 0.008, goal: 0.008}
+    # ★ Stalling is a SUCCESS for this gripper, not a failure: "closed onto the
+    #   object and stopped" is the desired outcome of a grasp. Allow it, and
+    #   treat "not moving slowly enough" as stalled once the goal tolerance is
+    #   met.
+    allow_stalling: true
+    stall_velocity_threshold: 0.001
+    stall_goal_tolerance: 0.008
+
+    # Effort ceiling (N.m) used only by the controller's own stall detection —
+    # it does NOT command torque. The real torque budget is enforced inside the
+    # SDK (torque_limit_nm in the URDF parameters), because it is allocated
+    # between the position gains per frame rather than sent as a value.
+    # ⚠ Keep it consistent with torque_limit_nm.
+    max_effort: 3.5

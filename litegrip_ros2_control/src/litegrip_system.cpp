@@ -2,39 +2,34 @@
 //
 // Real-time notes
 // ---------------
-// read()/write() do only this: one seqlock read or write (memcpy) plus a
-// constant number of floating-point operations. No locks, no allocations, no
-// socket, no Python. The seqlock read side has a bounded retry count
-// (state_read_retries_); once it is exhausted the previous frame is kept and OK
-// is returned — so controller_manager keeps running and the layer above decides
-// whether to stop from fault_code / feedback age (same strategy as the arm).
+// read() copies the ControlLoop's cached snapshot (a mutex-protected struct
+// copy, no I/O) and write() posts one target. Neither opens a socket, waits on
+// the bus, allocates, or touches Python — all of that happens on the SDK's own
+// control thread. So the controller_manager cycle stays cheap regardless of how
+// the CAN traffic is behaving.
 
 #include "litegrip_ros2_control/litegrip_system.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
 #include <exception>
+#include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include <pluginlib/class_list_macros.hpp>
 #include <rclcpp/logging.hpp>
 
+#include <litegrip/constants.hpp>
+#include <litegrip/exceptions.hpp>
+
 namespace litegrip_ros2_control {
 namespace {
 
-/** Log throttle period (seconds). Self-managed instead of using
- *  RCLCPP_*_THROTTLE: the latter's static Clock is constructed on the first
- *  call, and this path runs on the real-time thread. */
+/** Log throttle period (seconds). */
 constexpr double kLogThrottleS = 5.0;
-
-/** Poll interval while on_configure waits for the daemon. A non-real-time
- *  context, so sleeping is allowed. */
-constexpr auto kReadyPollInterval = std::chrono::milliseconds(50);
 
 std::string param_or(const hardware_interface::HardwareInfo &info,
                      const std::string &key, const std::string &fallback) {
@@ -107,27 +102,45 @@ double LitegripSystem::rad_to_width(double rad) const {
   return std::clamp(mm * 1e-3, 0.0, std::max(max_width_, 0.0));
 }
 
-bool LitegripSystem::within_red_line(double rad) const {
-  const double lo = std::min(red_open_rad_, red_close_rad_);
-  const double hi = std::max(red_open_rad_, red_close_rad_);
-  return rad >= lo - 1e-9 && rad <= hi + 1e-9;
+std::pair<double, double> LitegripSystem::commandable_width_range() const {
+  // The red lines come from the SDK's loaded baseline — the single source of
+  // truth — not from a second copy in the URDF parameters.
+  double red_min = litegrip::kPackageRedMin;
+  double red_max = litegrip::kPackageRedMax;
+  if (loop_ != nullptr) {
+    const litegrip::SafetyLimits &limits = loop_->safety_limits();
+    if (limits.enabled) {
+      red_min = std::min(limits.red_min_rad, limits.red_max_rad);
+      red_max = std::max(limits.red_min_rad, limits.red_max_rad);
+    }
+  }
+  // red_min is the wider (more negative) angle => the larger opening.
+  const double width_at_red_min = (closed_rad_ - red_min) * rad_to_mm_ * 1e-3;
+  const double width_at_red_max = (closed_rad_ - red_max) * rad_to_mm_ * 1e-3;
+  const double lo = std::max(min_width_, std::min(width_at_red_min,
+                                                  width_at_red_max));
+  const double hi = std::min(max_width_, std::max(width_at_red_min,
+                                                  width_at_red_max));
+  return {lo, std::max(lo, hi)};
 }
 
 double LitegripSystem::width_to_rad(double width) const {
-  // ① Clamp the width into the **commandable range** first: the model layer's
-  //    0~87 mm is wider than the ≈3.34~83.32 mm the red line permits, and
-  //    without clamping "fully open 87 mm" would be rejected wholesale by the
-  //    daemon (see the header for details).
-  const double min_commandable =
-      std::max(min_width_, rad_to_width(red_close_rad_));
-  const double max_commandable =
-      std::min(max_width_, rad_to_width(red_open_rad_));
-  const double clamped = std::clamp(width, min_commandable, max_commandable);
-  // ② Then clamp the angle by the red line (belt and braces: if the conversion
-  //    parameters were corrupted, this still cannot cross the line).
-  const double lo = std::min(red_open_rad_, red_close_rad_);
-  const double hi = std::max(red_open_rad_, red_close_rad_);
-  return std::clamp(closed_rad_ - clamped * 1e3 / rad_to_mm_, lo, hi);
+  // ① Clamp into the **commandable range** first: the model layer's 0~87 mm is
+  //    wider than the red lines permit, and without clamping an ordinary
+  //    "fully open 87 mm" would be rejected whole by the gate and nothing would
+  //    move (see the header for details).
+  const auto range = commandable_width_range();
+  const double clamped = std::clamp(width, range.first, range.second);
+  // ② Then clamp the angle by the red lines (belt and braces: if the conversion
+  //    parameters were corrupted, this still cannot cross them).
+  double red_min = litegrip::kPackageRedMin;
+  double red_max = litegrip::kPackageRedMax;
+  if (loop_ != nullptr) {
+    const litegrip::SafetyLimits &limits = loop_->safety_limits();
+    red_min = std::min(limits.red_min_rad, limits.red_max_rad);
+    red_max = std::max(limits.red_min_rad, limits.red_max_rad);
+  }
+  return std::clamp(closed_rad_ - clamped * 1e3 / rad_to_mm_, red_min, red_max);
 }
 
 // ───────────────────────── lifecycle ─────────────────────────
@@ -139,22 +152,61 @@ hardware_interface::CallbackReturn LitegripSystem::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
+  litegrip::ControlLoopConfig config;
   try {
     joint_name_ = sole_joint_name(info);
 
     closed_rad_ = param_double(info, "closed_rad", closed_rad_);
     rad_to_mm_ = param_double(info, "rad_to_mm", rad_to_mm_);
-    red_open_rad_ = param_double(info, "red_open_rad", red_open_rad_);
-    red_close_rad_ = param_double(info, "red_close_rad", red_close_rad_);
     min_width_ = param_double(info, "min_width", min_width_);
     max_width_ = param_double(info, "max_width", max_width_);
+
+    config.channel = param_or(info, "channel", litegrip::DefaultParams::kCanChannel);
+    config.can_id = param_int(info, "can_id", litegrip::GripperParams::kCanId);
+    if (info.hardware_parameters.find("mst_id") != info.hardware_parameters.end()) {
+      config.mst_id = param_int(info, "mst_id", litegrip::GripperParams::kMstId);
+    }
+    config.canfd_mode = param_bool(info, "canfd_mode", false);
+
+    // The dual switch. dry_run=true must be the default: an unconfigured stack
+    // must never reach for hardware.
+    config.dry_run = param_bool(info, "dry_run", true);
+    config.hardware_enable = param_bool(info, "hardware_enable", false);
+
+    config.control_rate_hz = param_double(info, "control_rate_hz", config.control_rate_hz);
+    config.feedback_timeout_s =
+        param_double(info, "feedback_timeout_s", config.feedback_timeout_s);
+    config.temperature_limit_c =
+        param_int(info, "temperature_limit_c", config.temperature_limit_c);
+    config.command_timeout_s =
+        param_double(info, "command_timeout_s", config.command_timeout_s);
+
+    config.max_velocity_rad_s =
+        param_double(info, "max_velocity_rad_s", config.max_velocity_rad_s);
+    config.torque_limit_nm =
+        param_double(info, "torque_limit_nm", config.torque_limit_nm);
+    config.safety_baseline =
+        param_or(info, "safety_baseline", litegrip::kDefaultSafetyBaseline);
+    config.max_position_error_rad =
+        param_double(info, "max_position_error_rad", config.max_position_error_rad);
+    config.max_feedback_velocity_rad_s = param_double(
+        info, "max_feedback_velocity_rad_s", config.max_feedback_velocity_rad_s);
+
+    config.kp = param_double(info, "kp", config.kp);
+    config.kd = param_double(info, "kd", config.kd);
+
+    config.pos_closed_rad = closed_rad_;
+    config.rad_to_mm = rad_to_mm_;
+    // The model layer's full-open angle, for consistency with the URDF limits.
+    config.pos_open_rad = closed_rad_ - max_width_ * 1e3 / rad_to_mm_;
+
+    export_diagnostics_ = param_bool(info, "export_diagnostics", true);
   } catch (const std::exception &error) {
     RCLCPP_ERROR(logger_, "invalid hardware parameter: %s", error.what());
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  // The conversion parameter has to be a positive "mm per rad" figure; zero
-  // would make the conversion produce inf.
+  // A "mm per rad" figure of zero would make the conversion diverge.
   if (!(rad_to_mm_ > 0.0)) {
     RCLCPP_ERROR(logger_,
                  "rad_to_mm must be a positive finite number, got %g — the "
@@ -168,111 +220,66 @@ hardware_interface::CallbackReturn LitegripSystem::on_init(
     return hardware_interface::CallbackReturn::ERROR;
   }
 
-  shm_name_ = param_or(info, "shm_name", LITEGRIP_SHM_DEFAULT_NAME);
-  connect_timeout_s_ = param_double(info, "connect_timeout_s", connect_timeout_s_);
-  heartbeat_timeout_s_ =
-      param_double(info, "heartbeat_timeout_s", heartbeat_timeout_s_);
-  state_read_retries_ = param_int(info, "state_read_retries", state_read_retries_);
-  configure_read_retries_ =
-      param_int(info, "configure_read_retries", configure_read_retries_);
-  export_diagnostics_ = param_bool(info, "export_diagnostics", true);
-
   RCLCPP_INFO(logger_,
-              "gripper hardware interface initialized: joint=%s, shm=%s, "
-              "calibration closed_rad=%g rad_to_mm=%g, red line [%g, %g] rad, "
-              "model opening [%g, %g] m",
-              joint_name_.c_str(), shm_name_.c_str(), closed_rad_, rad_to_mm_,
-              std::min(red_open_rad_, red_close_rad_),
-              std::max(red_open_rad_, red_close_rad_), min_width_, max_width_);
+              "gripper hardware interface initialized: joint=%s channel=%s "
+              "dry_run=%s hardware_enable=%s, calibration closed_rad=%g "
+              "rad_to_mm=%g, model opening [%g, %g] m, safety baseline=%s",
+              joint_name_.c_str(), config.channel.c_str(),
+              config.dry_run ? "true" : "false",
+              config.hardware_enable ? "true" : "false", closed_rad_, rad_to_mm_,
+              min_width_, max_width_, config.safety_baseline.c_str());
+
+  loop_config_ = config;
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn LitegripSystem::on_configure(
     const rclcpp_lifecycle::State & /*previous_state*/) {
-  // The shared memory segment is created by the **daemon**. Here we wait for it
-  // to appear and for "connected + fresh heartbeat": starting in the wrong order
-  // (plugin first) is normal, so this waits rather than failing outright.
-  const double deadline = monotonic_seconds() + connect_timeout_s_;
-  std::string last_error = "the shared memory segment does not exist yet";
-
-  while (monotonic_seconds() < deadline) {
-    if (shm_ == nullptr) {
-      const int rc = litegrip_shm_open(shm_name_.c_str(), /*create=*/0, &shm_);
-      if (rc != LITEGRIP_SHM_OK) {
-        last_error = "failed to open the shared memory segment (rc=" +
-                     std::to_string(rc) +
-                     "): the segment does not exist yet, or the layout version "
-                     "does not match (a stale segment has to be rebuilt by the "
-                     "daemon)";
-        std::this_thread::sleep_for(kReadyPollInterval);
-        continue;
-      }
-    }
-
-    LitegripState probe{};
-    const int rc =
-        litegrip_shm_read_state(shm_, &probe, configure_read_retries_);
-    if (rc != LITEGRIP_SHM_OK) {
-      last_error = "failed to read the shared memory state (rc=" +
-                   std::to_string(rc) + ")";
-      std::this_thread::sleep_for(kReadyPollInterval);
-      continue;
-    }
-    if (probe.connected == 0.0) {
-      last_error = "the daemon has not connected to the gripper yet "
-                   "(last_error=" +
-                   std::to_string(static_cast<int>(probe.last_error)) + ")";
-      std::this_thread::sleep_for(kReadyPollInterval);
-      continue;
-    }
-    if (monotonic_seconds() - probe.heartbeat_s > heartbeat_timeout_s_) {
-      last_error = "the daemon heartbeat has expired (heartbeat age " +
-                   std::to_string(monotonic_seconds() - probe.heartbeat_s) +
-                   "s)";
-      std::this_thread::sleep_for(kReadyPollInterval);
-      continue;
-    }
-
-    have_state_ = true;
-    state_buffer_ = probe;
-    last_heartbeat_s_ = probe.heartbeat_s;
-    daemon_alive_ = true;
-    apply_state(probe);
-    mode_ = Mode::kConfigured;
-    RCLCPP_INFO(logger_, "gripper daemon ready: dry_run=%s, enabled=%s",
-                probe.dry_run != 0.0 ? "yes" : "no",
-                probe.enabled != 0.0 ? "yes" : "no");
-    return hardware_interface::CallbackReturn::SUCCESS;
+  try {
+    loop_ = std::make_unique<litegrip::ControlLoop>(loop_config_);
+    // start() loads the safety baseline (fail-closed on a missing/invalid file),
+    // validates the deploy ceilings, and — unless dry_run — opens CAN, enables
+    // the motor and leaves it holding its current position.
+    loop_->start();
+  } catch (const std::exception &error) {
+    RCLCPP_ERROR(logger_,
+                 "could not start the gripper control loop: %s\n"
+                 "  ① dry_run=false requires hardware_enable=true\n"
+                 "  ② is the CAN interface up: ip -details link show %s\n"
+                 "  ③ is the safety baseline reachable: %s",
+                 error.what(), loop_config_.channel.c_str(),
+                 loop_config_.safety_baseline.c_str());
+    loop_.reset();
+    return hardware_interface::CallbackReturn::ERROR;
   }
 
-  if (shm_ != nullptr) {
-    litegrip_shm_close(shm_);
-    shm_ = nullptr;
-  }
-  RCLCPP_ERROR(logger_,
-               "timed out waiting for the gripper daemon (%.1fs): %s\n"
-               "  ① is the daemon up: grep litegrip_hw_daemon in litearm's launch\n"
-               "  ② do the shm names agree: this plugin's shm_name='%s'\n"
-               "  ③ does the segment exist: ls /dev/shm | grep litegrip",
-               connect_timeout_s_, last_error.c_str(), shm_name_.c_str());
-  return hardware_interface::CallbackReturn::ERROR;
+  RCLCPP_INFO(logger_,
+              "gripper control loop started (dry_run=%s); red lines in effect: "
+              "[%g, %g] rad",
+              loop_config_.dry_run ? "true" : "false",
+              loop_->safety_limits().red_min_rad,
+              loop_->safety_limits().red_max_rad);
+  return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn LitegripSystem::on_activate(
     const rclcpp_lifecycle::State & /*previous_state*/) {
-  if (shm_ == nullptr) {
+  if (loop_ == nullptr) {
     RCLCPP_ERROR(logger_,
-                 "shared memory is not open in on_activate (did on_configure "
-                 "fail?)");
+                 "the control loop is not running in on_activate (did "
+                 "on_configure fail?)");
     return hardware_interface::CallbackReturn::ERROR;
   }
-  // ★ Pull the command position to the **measured** position before sending the
-  //   first frame: otherwise, at the instant of activation, the daemon would
-  //   rush towards the initial value in the command interface (0 = fully
+
+  // ★ Latch the command position to the MEASURED opening before letting the loop
+  //   follow commands: otherwise, at the instant of activation, it would rush
+  //   towards whatever the command interface happened to hold (0 = fully
   //   closed), and that is a real mechanical motion.
-  latch_command_to_measured();
-  mode_ = Mode::kActive;
-  publish_command();
+  command_position_ = rad_to_width(loop_->state().position_rad);
+  loop_->set_target_mm(command_position_ * 1e3);
+  loop_->set_enable(true);
+  active_ = true;
+
   RCLCPP_INFO(logger_,
               "gripper hardware interface activated: command position latched "
               "at the measured opening %.4f m",
@@ -282,56 +289,49 @@ hardware_interface::CallbackReturn LitegripSystem::on_activate(
 
 hardware_interface::CallbackReturn LitegripSystem::on_deactivate(
     const rclcpp_lifecycle::State & /*previous_state*/) {
-  // ★ On handing control back, **hold position** rather than disable: disabling
-  //   the gripper means it may drop whatever it is holding. The direction
-  //   matches the arm (the arm's disable_on_shutdown also defaults to false and
-  //   holds position). After that the command frames go stale on their own and
-  //   the daemon freezes by its own staleness rule — belt and braces.
-  if (shm_ != nullptr) {
-    latch_command_to_measured();
-    publish_command();
+  // ★ On handing control back, HOLD position rather than disable: disabling the
+  //   gripper means it may drop whatever it is holding. The direction matches
+  //   the arm (whose disable_on_shutdown also defaults to false and holds
+  //   position).
+  if (loop_ != nullptr) {
+    command_position_ = rad_to_width(loop_->state().position_rad);
+    loop_->set_target_mm(command_position_ * 1e3);
   }
-  mode_ = Mode::kStopped;
+  active_ = false;
   RCLCPP_INFO(logger_,
-              "gripper hardware interface deactivated (one hold-in-place "
-              "command frame was sent)");
+              "gripper hardware interface deactivated (holding at the measured "
+              "opening %.4f m)",
+              command_position_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn LitegripSystem::on_cleanup(
     const rclcpp_lifecycle::State & /*previous_state*/) {
-  if (shm_ != nullptr) {
-    litegrip_shm_close(shm_);
-    shm_ = nullptr;
+  if (loop_ != nullptr) {
+    loop_->stop();  // zero torque, then disable and close CAN
+    loop_.reset();
   }
-  mode_ = Mode::kUnconfigured;
+  active_ = false;
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::CallbackReturn LitegripSystem::on_shutdown(
     const rclcpp_lifecycle::State & /*previous_state*/) {
   // The same teardown as on_cleanup; written separately because the semantics
-  // differ (shutdown = the process is about to go away). The shared memory is
-  // not unlinked here: the segment belongs to the daemon, and either the plugin
-  // or the daemon may exit first.
-  if (shm_ != nullptr) {
-    litegrip_shm_close(shm_);
-    shm_ = nullptr;
-  }
-  mode_ = Mode::kUnconfigured;
-  return hardware_interface::CallbackReturn::SUCCESS;
+  // differ (shutdown = the process is about to go away).
+  return on_cleanup(rclcpp_lifecycle::State());
 }
 
 hardware_interface::CallbackReturn LitegripSystem::on_error(
     const rclcpp_lifecycle::State & /*previous_state*/) {
-  if (shm_ != nullptr) {
-    litegrip_shm_close(shm_);
-    shm_ = nullptr;
+  if (loop_ != nullptr) {
+    loop_->stop();
+    loop_.reset();
   }
-  mode_ = Mode::kUnconfigured;
+  active_ = false;
   RCLCPP_ERROR(logger_,
                "gripper hardware interface entered the error state: "
-               "command_manager will stop the controllers");
+               "controller_manager will stop the controllers");
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -368,9 +368,8 @@ LitegripSystem::export_state_interfaces() {
 
 std::vector<hardware_interface::CommandInterface>
 LitegripSystem::export_command_interfaces() {
-  // ★ position only (decided by the user on 2026-09-23). The trajectory rate
-  //   ceiling and the torque budget are daemon parameters, not per-command
-  //   fields — see the comments in litegrip_shm.h.
+  // ★ position only. The trajectory rate ceiling and the torque budget are
+  //   component deployment parameters, not per-command fields.
   std::vector<hardware_interface::CommandInterface> interfaces;
   interfaces.emplace_back(joint_name_, hardware_interface::HW_IF_POSITION,
                           &command_position_);
@@ -379,139 +378,79 @@ LitegripSystem::export_command_interfaces() {
 
 // ───────────────────────── read / write ─────────────────────────
 
-void LitegripSystem::apply_state(const LitegripState &state) {
-  // Position/velocity: rad → opening in m and m/s.
-  // ★ The velocity **must flip sign**: the more negative rad is, the wider the
-  //   opening, so d(opening)/dt = −v_rad × rad_to_mm×1e-3. Missing the minus
-  //   sign raises no error, it only quietly inverts the "stopped or not"
-  //   decision, so it is written out explicitly here.
-  state_position_ = rad_to_width(state.position[0]);
-  state_velocity_ =
-      -state.velocity[0] * rad_to_mm_ * 1e-3;
-  // Torque passes the driver reading straight through (no gear-ratio
-  // conversion, same as the old driver).
-  state_effort_ = state.effort[0];
-  state_temperature_mos_ = state.temperature_mos[0];
-  state_temperature_coil_ = state.temperature_coil[0];
-  state_error_code_ = state.error_code[0];
-  state_fault_code_ = state.fault_code[0];
-  state_feedback_age_ = state.feedback_age_s[0];
-
-  const double now = monotonic_seconds();
-  if (state.fault_code[0] != 0.0 && !reported_fault_ &&
-      now - last_fault_log_s_ > kLogThrottleS) {
-    reported_fault_ = true;
-    last_fault_log_s_ = now;
-    RCLCPP_ERROR(logger_,
-                 "gripper fault code %d (last_error=%d) — the layer above "
-                 "should stop and investigate on the strength of this",
-                 static_cast<int>(state.fault_code[0]),
-                 static_cast<int>(state.last_error));
-  }
-  if (state.fault_code[0] == 0.0) {
-    reported_fault_ = false;
-  }
-  if (state.latched != 0.0 && !reported_latched_) {
-    reported_latched_ = true;
-    RCLCPP_ERROR(logger_,
-                 "★ the daemon has **latched** a safe stop (no self-recovery); "
-                 "a human must investigate and restart the daemon");
-  }
-}
-
 hardware_interface::return_type LitegripSystem::read(
     const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) {
-  if (shm_ == nullptr) {
+  if (loop_ == nullptr) {
     return hardware_interface::return_type::ERROR;
   }
 
-  LitegripState fresh{};
-  const int rc = litegrip_shm_read_state(shm_, &fresh, state_read_retries_);
-  if (rc == LITEGRIP_SHM_TORN) {
-    // Torn read: keep the previous frame (the state interface's memory was not
-    // modified) and skip the update this round. Not counted as a fault — this
-    // is the normal cost of a lock-free read, not a hardware error.
-    ++torn_state_reads_;
-    return hardware_interface::return_type::OK;
-  }
-  if (rc != LITEGRIP_SHM_OK) {
-    RCLCPP_ERROR(logger_, "failed to read the shared memory state: rc=%d", rc);
-    return hardware_interface::return_type::ERROR;
-  }
+  // A cached snapshot: no CAN, no locks held across I/O, no allocation.
+  const litegrip::GripperState state = loop_->state();
+
+  state_position_ = rad_to_width(state.position_rad);
+  // ★ The velocity MUST flip sign: the more negative rad is, the wider the
+  //   opening, so d(opening)/dt = −v_rad × rad_to_mm×1e-3. Missing the minus
+  //   sign raises no error — it only quietly inverts the "stopped or not"
+  //   decision, so it is written out explicitly here.
+  state_velocity_ = -state.velocity_rad_s * rad_to_mm_ * 1e-3;
+  // Torque passes the driver reading straight through (no gear-ratio
+  // conversion, same as the old driver).
+  state_effort_ = state.torque_nm;
+  state_temperature_mos_ = state.temperature_mos;
+  state_temperature_coil_ = state.temperature_coil;
+  state_error_code_ = state.error_code;
+  state_fault_code_ = loop_->fault_code();
+  state_feedback_age_ = state.data_age_s;
 
   const double now = monotonic_seconds();
-  if (fresh.heartbeat_s > last_heartbeat_s_) {
-    last_heartbeat_s_ = fresh.heartbeat_s;
-    daemon_alive_ = true;
-    reported_daemon_loss_ = false;
-  } else if (daemon_alive_ &&
-             now - last_heartbeat_s_ > heartbeat_timeout_s_) {
-    daemon_alive_ = false;
-    if (!reported_daemon_loss_ && now - last_stale_log_s_ > kLogThrottleS) {
-      reported_daemon_loss_ = true;
-      last_stale_log_s_ = now;
+  if (state_fault_code_ != 0.0) {
+    if (!reported_fault_ && now - last_fault_log_s_ > kLogThrottleS) {
+      reported_fault_ = true;
+      last_fault_log_s_ = now;
       RCLCPP_ERROR(logger_,
-                   "gripper daemon heartbeat expired (%.2fs) — the state is "
-                   "frozen and whether the hardware is currently controllable "
-                   "is **unknown**; the layer above should stop",
-                   now - last_heartbeat_s_);
+                   "gripper fault code %d — the layer above should stop and "
+                   "investigate on the strength of this",
+                   static_cast<int>(state_fault_code_));
     }
+  } else {
+    reported_fault_ = false;
+  }
+  if (state.is_stale() && now - last_stale_log_s_ > kLogThrottleS) {
+    last_stale_log_s_ = now;
+    RCLCPP_WARN(logger_,
+                "gripper feedback is stale (age %.2fs) — the state is frozen "
+                "and whether the hardware is currently controllable is "
+                "unknown",
+                state.data_age_s);
   }
 
-  have_state_ = true;
-  state_buffer_ = fresh;
-  apply_state(fresh);
   return hardware_interface::return_type::OK;
-}
-
-void LitegripSystem::latch_command_to_measured() {
-  command_position_ = have_state_ ? state_position_ : 0.0;
-}
-
-void LitegripSystem::publish_command() {
-  if (shm_ == nullptr) {
-    return;
-  }
-  // A non-finite number is never sent: any comparison involving NaN is false,
-  // so it would slip past every range check the daemon has (that is the one
-  // input shape it cannot catch).
-  if (!std::isfinite(command_position_)) {
-    RCLCPP_ERROR(logger_,
-                 "command position is not finite (%g) — not publishing this "
-                 "frame",
-                 command_position_);
-    return;
-  }
-
-  LitegripCommand command{};
-  command.position[0] = width_to_rad(command_position_);
-  // Enable: request enable whenever this component is active. The disable path
-  // is left to the upper-layer migration round (see the class comment).
-  command.enable = (mode_ == Mode::kActive) ? 1.0 : 0.0;
-  // Emergency stop: a reserved field, always 0 this round (see the class
-  // comment).
-  command.estop = 0.0;
-  command.stamp_s = monotonic_seconds();
-  command.cycle_count = ++command_cycle_;
-
-  const int rc = litegrip_shm_publish_command(shm_, &command);
-  if (rc != LITEGRIP_SHM_OK) {
-    RCLCPP_ERROR(logger_, "failed to publish the shared memory command: rc=%d",
-                 rc);
-  }
 }
 
 hardware_interface::return_type LitegripSystem::write(
     const rclcpp::Time & /*time*/, const rclcpp::Duration & /*period*/) {
-  if (shm_ == nullptr) {
+  if (loop_ == nullptr) {
     return hardware_interface::return_type::ERROR;
   }
-  if (mode_ != Mode::kActive) {
-    // While not active no command stream is produced: let the daemon hold
-    // position by its own "the command is stale" rule.
+  if (!active_) {
+    // While not active no command is posted: the loop's own staleness rule
+    // makes it hold position.
     return hardware_interface::return_type::OK;
   }
-  publish_command();
+
+  // A non-finite number is never sent: every comparison involving NaN is false,
+  // so it would slip past every range check in the gate (that is the one input
+  // shape it cannot catch).
+  if (!std::isfinite(command_position_)) {
+    RCLCPP_ERROR(logger_,
+                 "command position is not finite (%g) — not posting this "
+                 "target",
+                 command_position_);
+    return hardware_interface::return_type::OK;
+  }
+
+  // The SDK works in motor radians; the interface is in metres.
+  loop_->set_target_rad(width_to_rad(command_position_));
   return hardware_interface::return_type::OK;
 }
 

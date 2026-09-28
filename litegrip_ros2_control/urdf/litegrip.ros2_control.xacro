@@ -4,110 +4,168 @@
   for the LiteGrip gripper.
 
   This file is a declaration only: no kinematics and no geometry. The gripper's
-  link / joint / mimic come from the description package
-  (litearm_manipulation/urdf/litearm_gripper.urdf.xacro; the geometry comes from
-  the litegrip description package). Usage:
+  link / joint / mimic come from the description package. Usage:
 
       <xacro:include filename="$(find litegrip_ros2_control)/urdf/litegrip.ros2_control.xacro"/>
 
-  ★ Why a <plugin> rather than a "bundled node + topics"
-  ══════════════════════════════════════════════════════
-  The gripper thereby becomes a ros2_control **hardware component**: it is
-  loaded / activated / deactivated by controller_manager together with the arm,
-  its joint shows up in /joint_states, and controllers (JTC / forward) claim its
-  position interface directly. So the layer above no longer has to invent a
-  topic protocol of its own plus a bridging node of its own — this is the same
-  road the arm takes, with only one mental model to carry.
+  Why a plugin rather than a bundled node plus topics
+  ==================================================
+  The gripper is thereby a ros2_control hardware component: it is loaded,
+  activated and deactivated by controller_manager together with the arm, its
+  joint shows up in /joint_states, and controllers claim its position interface
+  directly. The layer above does not have to invent a topic protocol plus a
+  bridging node of its own.
 
-  ★ Interface surface (decided by the user on 2026-09-23)
-  ═══════════════════════════════════════════════════════
-    command: position only (DM MIT position control underneath, the same
-             protocol family as the other joints)
-    state:   position / velocity / effort (matching the other joints' trio)
+  Interface surface (decided by the user on 2026-09-23)
+  ====================================================
+    command: position only (DM MIT position control underneath)
+    state:   position / velocity / effort, plus diagnostics
 
-  The trajectory advance rate ceiling and the torque budget are **not** command
-  interfaces but daemon parameters (see config/litegrip_hw.yaml): they describe
-  "how this gripper is allowed to move" and belong to the deployment
-  configuration, so they must not be decided by each command publisher on its
-  own.
+  The trajectory rate ceiling and the torque budget are NOT command interfaces
+  but deployment parameters of this component (see config/litegrip_hw.yaml):
+  they describe how this gripper is allowed to move, so a command publisher must
+  not be able to decide them.
 
-  ⚠ Conversion parameters (closed_rad / rad_to_mm / red line)
-  ═══════════════════════════════════════════════════════════════
-  Their source and the consistency rule: they come from
-  sdk/litegrip/physical_calibration.json and the safety baseline JSON; the
-  values here are **copies** (same source, same values as litearm_manipulation's
-  manipulation.yaml). The single source of truth is still those two JSON files —
-  after a recalibration this file must be kept in sync, and the consistency is
-  checked by test/test_gripper_motor_scale.py recomputing against the SDK (it
-  goes red on a mismatch).
+  Where the safety limits live
+  ============================
+  Not here. The red lines are loaded by the SDK from its versioned safety
+  baseline (the safety_baseline parameter below selects the version, or names an
+  explicit file), and this file carries no copy of them. The previous version
+  had red_open_rad / red_close_rad as parameters, which meant two sources of
+  truth for the same safety quantity; that duplication is gone. The plugin asks
+  the SDK which red lines are in effect and derives the commandable opening
+  range from them.
+
+  Conversion parameters (closed_rad / rad_to_mm)
+  =============================================
+  These come from the unit's calibration (factory_calibration.json). The values
+  here are copies of that file and must be kept in sync after a recalibration.
 -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <!-- Shared memory segment name: must match the daemon's shm_name parameter -->
-  <xacro:arg name="litegrip_shm_name" default="/litegrip_hw"/>
-
-  <!-- Calibration (physical_calibration.json): the motor angle at opening = 0,
-       and how many mm one rad is -->
+  <!-- ── calibration (source: factory_calibration.json) ───────────────────── -->
+  <!-- Motor angle at opening = 0 mm, and how many mm one rad is. -->
   <xacro:arg name="litegrip_closed_rad" default="0.04139"/>
   <xacro:arg name="litegrip_rad_to_mm" default="65.0231"/>
-
-  <!-- Safety red line (safety_limits_350.json, safety baseline 3.5). The more
-       negative the value, the wider the opening.
-       ⚠ This is the basis of the "commandable range": the model layer's
-         0~87 mm is wider than the ≈3.34~83.32 mm the red line allows, and the
-         plugin clamps the target into the commandable range before publishing —
-         without clamping, "fully open 87 mm" would be rejected wholesale by the
-         daemon (symptom: the gripper does not move at all, it only leaves a 1
-         behind in fault_code). -->
-  <xacro:arg name="litegrip_red_open_rad" default="-1.24"/>
-  <xacro:arg name="litegrip_red_close_rad" default="-0.01"/>
-
-  <!-- Model-layer opening range (m), matching the joint limits in
-       litearm_gripper.urdf.xacro -->
+  <!-- Model-layer opening range (m), matching the URDF joint limits. -->
   <xacro:arg name="litegrip_min_width" default="0.0"/>
   <xacro:arg name="litegrip_max_width" default="0.087"/>
 
-  <!-- Timeout for waiting for the daemon to become ready (seconds). Whether the
-       segment does not exist or the daemon has not connected to the gripper, it
-       errors out here, and the message carries actionable troubleshooting
-       hints. -->
-  <xacro:arg name="litegrip_connect_timeout_s" default="10.0"/>
-  <!-- Daemon heartbeat timeout (seconds). Past it the daemon is presumed dead:
-       the state freezes and an error is logged. -->
-  <xacro:arg name="litegrip_heartbeat_timeout_s" default="1.0"/>
+  <!-- ── hardware channel ────────────────────────────────────────────────── -->
+  <!-- Classic CAN (not FD), 1 Mbit/s (bittiming is configured system-side). -->
+  <xacro:arg name="litegrip_channel" default="can0"/>
+  <xacro:arg name="litegrip_can_id" default="8"/>
+  <xacro:arg name="litegrip_mst_id" default="24"/>
+  <xacro:arg name="litegrip_canfd_mode" default="false"/>
+
+  <!-- ── the dual switch (both are required for the real-hardware path) ──── -->
+  <!-- They block two different things: dry_run blocks "do not touch hardware
+       while debugging", hardware_enable blocks "is a gripper actually attached
+       to this machine". Merged into one, reporting the true state would require
+       letting the component drive the motor. The defaults are the safe ones:
+       dry_run up, hardware_enable down. -->
+  <xacro:arg name="litegrip_dry_run" default="true"/>
+  <xacro:arg name="litegrip_hardware_enable" default="false"/>
+
+  <!-- ── control loop ───────────────────────────────────────────────────── -->
+  <!-- DM motors need a continuous MIT frame stream; the SDK's own streaming
+       interface uses 200 Hz. -->
+  <xacro:arg name="litegrip_control_rate_hz" default="200.0"/>
+  <!-- How long without a NEW feedback frame counts as communication loss. -->
+  <xacro:arg name="litegrip_feedback_timeout_s" default="0.5"/>
+  <!-- Temperature ceiling (degC), checked for MOS and coil. This is "stop
+       before the driver trips on its own" — the driver's overtemperature fault
+       is already past that point. -->
+  <xacro:arg name="litegrip_temperature_limit_c" default="80"/>
+  <!-- Stale-command criterion: hold position once no new command frame has
+       arrived for this long. -->
+  <xacro:arg name="litegrip_command_timeout_s" default="0.2"/>
+
+  <!-- ── safety: rate ceiling and torque budget ─────────────────────────── -->
+  <!-- Both can only be turned DOWN, never up (the SDK refuses anything above
+       its hard ceilings). -->
+  <!-- Command trajectory advance rate ceiling (rad/s). It is NOT the velocity
+       setpoint in the MIT frame: the dq field always stays 0, and this value
+       caps how far the target may advance per cycle. The default is the SDK's
+       own ceiling, derived from its stopping-distance model at the packaged
+       baseline; tighten it for real working conditions before a real grasp. -->
+  <xacro:arg name="litegrip_max_velocity_rad_s" default="0.436"/>
+  <!-- Maximum total control torque allowed for this motion (N.m). It is NOT
+       written into any frame field: it is allocated between the two position
+       gains so that kp*e_b + kd*v_b stays within budget, with e_b / v_b the
+       worst-case bounds. 3.5 is the rated torque of the DM-J4310-2EC. -->
+  <xacro:arg name="litegrip_torque_limit_nm" default="3.5"/>
+  <!-- Versioned safety baseline, or an explicit path to a baseline file. -->
+  <!-- An unknown version or a missing file makes the component REFUSE to
+       start rather than fall back to a default nobody confirmed. -->
+  <xacro:arg name="litegrip_safety_baseline" default="3.5"/>
+
+  <!-- Worst-case position error bound (rad). -1 = derive it from the width of
+       the red lines, which is a real bound because both the target and the
+       reading are forced to stay inside them. -->
+  <xacro:arg name="litegrip_max_position_error_rad" default="-1.0"/>
+
+  <!-- Worst-case feedback velocity bound (rad/s).
+       WARNING: -1 means NOT GIVEN, which means REFUSE TO SEND ANY MOTION
+       FRAME. That is deliberate fail-closed behaviour, not a placeholder: the
+       value must be calibrated on the real hardware (run it through real
+       working conditions, take the peak feedback velocity and add margin)
+       before the gripper will move at all. -->
+  <xacro:arg name="litegrip_max_feedback_velocity_rad_s" default="-1.0"/>
+
+  <!-- MIT gain upper bounds; each frame re-allocates them from the budget. -->
+  <xacro:arg name="litegrip_kp" default="20.0"/>
+  <xacro:arg name="litegrip_kd" default="0.5"/>
+
   <!-- Export the diagnostic state interfaces (temperature / error_code /
        fault_code / feedback age). They are not part of the standard trio and
        joint_state_broadcaster will not claim them; on activation the CM warns
-       that "these interfaces are unclaimed" — that is expected, so set false if
-       it is too noisy. -->
+       that these interfaces are unclaimed, which is expected — set false if it
+       is too noisy. -->
   <xacro:arg name="litegrip_export_diagnostics" default="true"/>
 
   <ros2_control name="LitegripSystem" type="system">
     <hardware>
-      <!-- ★ Loaded as a plugin: this is where "as a hardware_interface" lands -->
       <plugin>litegrip_ros2_control/LitegripSystem</plugin>
 
-      <param name="shm_name">$(arg litegrip_shm_name)</param>
+      <param name="channel">$(arg litegrip_channel)</param>
+      <param name="can_id">$(arg litegrip_can_id)</param>
+      <param name="mst_id">$(arg litegrip_mst_id)</param>
+      <param name="canfd_mode">$(arg litegrip_canfd_mode)</param>
+
+      <param name="dry_run">$(arg litegrip_dry_run)</param>
+      <param name="hardware_enable">$(arg litegrip_hardware_enable)</param>
+
+      <param name="control_rate_hz">$(arg litegrip_control_rate_hz)</param>
+      <param name="feedback_timeout_s">$(arg litegrip_feedback_timeout_s)</param>
+      <param name="temperature_limit_c">$(arg litegrip_temperature_limit_c)</param>
+      <param name="command_timeout_s">$(arg litegrip_command_timeout_s)</param>
+
+      <param name="max_velocity_rad_s">$(arg litegrip_max_velocity_rad_s)</param>
+      <param name="torque_limit_nm">$(arg litegrip_torque_limit_nm)</param>
+      <param name="safety_baseline">$(arg litegrip_safety_baseline)</param>
+      <param name="max_position_error_rad">$(arg litegrip_max_position_error_rad)</param>
+      <param name="max_feedback_velocity_rad_s">$(arg litegrip_max_feedback_velocity_rad_s)</param>
+
+      <param name="kp">$(arg litegrip_kp)</param>
+      <param name="kd">$(arg litegrip_kd)</param>
+
       <param name="closed_rad">$(arg litegrip_closed_rad)</param>
       <param name="rad_to_mm">$(arg litegrip_rad_to_mm)</param>
-      <param name="red_open_rad">$(arg litegrip_red_open_rad)</param>
-      <param name="red_close_rad">$(arg litegrip_red_close_rad)</param>
       <param name="min_width">$(arg litegrip_min_width)</param>
       <param name="max_width">$(arg litegrip_max_width)</param>
-      <param name="connect_timeout_s">$(arg litegrip_connect_timeout_s)</param>
-      <param name="heartbeat_timeout_s">$(arg litegrip_heartbeat_timeout_s)</param>
+
       <param name="export_diagnostics">$(arg litegrip_export_diagnostics)</param>
     </hardware>
 
-    <!-- ★ The master joint. The two fingers (gripper_slide_joint_left/right) are
-         its <mimic>, have no independent command port, and therefore do **not
-         appear** here — a real gripper has only one transmission. The joint
-         name must match urdf/litearm_gripper.urdf.xacro. -->
+    <!-- The master joint. The two fingers (gripper_slide_joint_left/right) are
+         its mimic, have no independent command port, and therefore do NOT
+         appear here — a real gripper has only one transmission. The joint name
+         must match the description package's URDF. -->
     <joint name="gripper_opening_joint">
-      <!-- Only position is exposed for command: MIT position control underneath,
-           the same as the other joints -->
+      <!-- Only position is exposed for command. -->
       <command_interface name="position"/>
-      <!-- Feedback like any other joint: position / velocity / torque -->
+      <!-- Feedback like any other joint, plus diagnostics. -->
       <state_interface name="position"/>
       <state_interface name="velocity"/>
       <state_interface name="effort"/>
