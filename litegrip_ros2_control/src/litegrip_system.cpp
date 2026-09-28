@@ -310,18 +310,41 @@ hardware_interface::CallbackReturn LitegripSystem::on_activate(
   }
 
   // ★ Latch the command position to the MEASURED opening before letting the loop
-  //   follow commands: otherwise, at the instant of activation, it would rush
-  //   towards whatever the command interface happened to hold (0 = fully
-  //   closed), and that is a real mechanical motion.
-  command_position_ = rad_to_width(loop_->state().position_rad);
+  //   follow commands.
+  //
+  //   Whatever the command interface holds at this instant must be treated as
+  //   meaningless, not as a goal. ros2_control initialises command interfaces to
+  //   0.0, and that 0.0 is a fully closed gripper — so treating it as a goal
+  //   makes the gripper travel to the closed end the moment the stack comes up,
+  //   from wherever it actually was. Latching makes the target EQUAL the current
+  //   position, so the initial value is irrelevant and the gripper simply stays
+  //   put.
+  const litegrip::GripperState state = loop_->state();
+  if (!state.has_data() || !std::isfinite(state.position_rad)) {
+    // Never latch a placeholder: without a real measurement there is no "current
+    // position" to hold, and inventing one would command a motion nobody asked
+    // for. Refuse instead — on_configure's init() already waits for a status
+    // frame, so reaching here means something is genuinely wrong.
+    RCLCPP_ERROR(logger_,
+                 "refusing to activate: no valid position measurement yet "
+                 "(feedback age %.3f s; inf means never received). The command "
+                 "position cannot be latched to 'where it currently is', and "
+                 "latching it to a default would command a motion nobody asked "
+                 "for.",
+                 state.data_age_s);
+    return hardware_interface::CallbackReturn::ERROR;
+  }
+
+  command_position_ = rad_to_width(state.position_rad);
   loop_->set_target_mm(command_position_ * 1e3);
   loop_->set_enable(true);
   active_ = true;
 
   RCLCPP_INFO(logger_,
-              "gripper hardware interface activated: command position latched "
-              "at the measured opening %.4f m",
-              command_position_);
+              "gripper hardware interface activated: holding the measured "
+              "position (%.4f rad -> %.4f m opening); the command interface's "
+              "initial value was ignored",
+              state.position_rad, command_position_);
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 

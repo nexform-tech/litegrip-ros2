@@ -257,3 +257,51 @@ TEST(LitegripSystemTest, WriteBeyondTheRangeIsClampedNotRejected) {
   const double age = states[7].get_value();
   EXPECT_TRUE(std::isfinite(age) || age < 0.0);
 }
+
+// ── activation must hold, not drive to the interface's default ────────────
+
+TEST(LitegripSystemTest, ActivateIgnoresWhateverTheCommandInterfaceInitiallyHeld) {
+  // ros2_control initialises command interfaces to 0.0, and 0.0 opening is a
+  // fully closed gripper. Treating that as a goal makes the gripper travel to
+  // the closed end the moment the stack comes up, from wherever it actually was.
+  //
+  // The requirement is that the ros2_control layer's target EQUALS the current
+  // position, so the initial value is irrelevant. This checks that literally:
+  // whatever is in the interface before activation gets overwritten.
+  for (const double preloaded : {0.0, 0.087, -1.0, 42.0}) {
+    auto system = make_configured(make_info());
+    system->export_command_interfaces()[0].set_value(preloaded);
+    const double measured_before =
+        system->export_state_interfaces()[0].get_value();
+
+    ASSERT_EQ(system->on_activate(rclcpp_lifecycle::State()),
+              CallbackReturn::SUCCESS)
+        << "preloaded command value " << preloaded;
+
+    const double latched = system->export_command_interfaces()[0].get_value();
+    EXPECT_NEAR(latched, measured_before, 1e-6)
+        << "the command interface's initial value " << preloaded
+        << " was treated as a goal instead of being latched to the measured "
+        << "opening " << measured_before;
+  }
+}
+
+TEST(LitegripSystemTest, ActivateHoldsInsteadOfDrivingTowardZero) {
+  // The behavioural consequence of the above: after activation, with no goal
+  // sent, the gripper must stay where it is.
+  auto system = make_configured(make_info());
+  ASSERT_EQ(system->on_activate(rclcpp_lifecycle::State()), CallbackReturn::SUCCESS);
+
+  ASSERT_EQ(system->read(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  const double at_activation = system->export_state_interfaces()[0].get_value();
+
+  sleep_ms(600);
+  ASSERT_EQ(system->read(rclcpp::Time(0), rclcpp::Duration(0, 0)),
+            hardware_interface::return_type::OK);
+  const double after = system->export_state_interfaces()[0].get_value();
+
+  EXPECT_NEAR(after, at_activation, 0.001)
+      << "the gripper moved after activation; with no goal sent it must hold "
+         "position";
+}
