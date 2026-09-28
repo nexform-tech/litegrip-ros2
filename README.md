@@ -2,8 +2,11 @@
 
 ROS 2 driver for the **LiteGrip lightweight robotic gripper series**.
 
-> **Status:** repository initialized. Source code, packaging and documentation
-> have not landed yet.
+## Packages
+
+| Package | Type | Role |
+| --- | --- | --- |
+| `litegrip_ros2_control` | ament_cmake | `ros2_control` hardware interface: a C++ `SystemInterface` plugin exchanging state and command blocks with a Python hardware daemon over POSIX shared memory; the daemon owns the CAN device and the vendor SDK and enforces the safety gate |
 
 ## Scope
 
@@ -11,7 +14,7 @@ ROS 2 driver for the **LiteGrip lightweight robotic gripper series**.
 | --- | --- |
 | Product | LiteGrip lightweight robotic gripper series |
 | Repository role | ROS 2 driver |
-| Status | Initializing — no source code yet |
+| Status | Active — ros2_control hardware interface landed |
 
 ## Related repositories
 

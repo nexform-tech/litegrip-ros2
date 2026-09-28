@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""litegrip_hw_daemon — a thin entry-point shell.
+
+The real implementation (arguments, config merging, the loop, the teardown)
+lives in ``litegrip_ros2_control/hw_daemon.py``; this file only turns it into an
+executable, so that launch / systemd / the command line can all start it under
+the same name.
+
+    litegrip_hw_daemon --hw-config <config/litegrip_hw.yaml>
+    litegrip_hw_daemon --no-dry-run --hardware-enable   # ★ both switches required
+    litegrip_hw_daemon --help
+"""
+
+import sys
+
+from litegrip_ros2_control.hw_daemon import main
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>litegrip_ros2_control</name>
+  <version>1.0.0</version>
+  <description>
+    The ros2_control adapter layer for the LiteGrip gripper: a C++
+    SystemInterface plugin + the shared memory contract + a Python hardware
+    daemon that owns can0 exclusively (its peer is the LiteGrip gripper, over
+    the STM32's gs_usb bridge).
+
+    Layered isomorphically to litearm_ros2_control: the C++ plugin side does
+    only memcpy and the "opening (m) ⇄ motor angle (rad)" conversion, with no
+    Python in the real-time loop; all hardware interaction, red-line checks,
+    torque budget allocation and safe stops live in the daemon.
+
+    Interface surface (decided by the user on 2026-09-23): **command exposes
+    position only** (matching the arm joints, MIT position control underneath);
+    **state exposes position/velocity/effort** (matching the arm joints).
+  </description>
+  <maintainer email="TODO@email.com">TODO</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
