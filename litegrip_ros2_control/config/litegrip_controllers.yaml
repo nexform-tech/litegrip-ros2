@@ -1,0 +1,62 @@
+# litegrip_controllers.yaml — the gripper controller declaration (shares the
+# same controller_manager as the arm).
+#
+# Loaded by the arm's control launch as an **extra params file** (alongside
+# litearm_ros2_control/config/litearm_controllers.yaml). Two separate files keep
+# the gripper's controller configuration in the gripper's own package — the arm
+# side needs to know nothing about the gripper.
+#
+# ⚠ Dependency: what this file declares are controllers **on top of the hardware
+#   interface**, so the hardware component in urdf/litegrip.ros2_control.xacro
+#   must already have been loaded (i.e. the description file has to include it),
+#   otherwise the spawner will not find gripper_opening_joint's interfaces.
+
+controller_manager:
+  ros__parameters:
+    # ★ GripperActionController, not a JointTrajectoryController.
+    #
+    #   This is a gripper, and its normal ending is "close until contact and
+    #   stop" — while grasping it gets stuck on the object and never reaches the
+    #   commanded opening. Under a JTC that ending had to be rescued with
+    #   goal_time: 0.0 (no timeout judgement at all), which is a blunt trade: it
+    #   gives up trajectory monitoring for everything. GripperActionController
+    #   expresses the same intent directly, with stall and goal tolerance
+    #   criteria that mean what they say.
+    #
+    #   The action it provides is control_msgs/action/GripperCommand on
+    #   <name>/gripper_cmd, NOT FollowJointTrajectory on
+    #   <name>/follow_joint_trajectory. That is an externally visible change:
+    #   anything hard-wired to the old action name must be updated.
+    gripper_controller:
+      type: position_controllers/GripperActionController
+
+gripper_controller:
+  ros__parameters:
+    # The master joint only. The two fingers are its <mimic> and have no
+    # independent command port.
+    joint: gripper_opening_joint
+
+    # How often the controller checks whether the goal was reached.
+    action_monitor_rate: 20.0
+
+    # Trajectory/goal tolerance in metres. The opening range is only ~0.087 m,
+    # so these are two orders of magnitude smaller than the arm's radian
+    # tolerances: 8 mm is wide enough to tolerate the steady-state droop that
+    # calibration and elasticity bring, and tight enough that "did not get
+    # there" is not taken for "got there".
+    goal_tolerance: 0.008
+
+    # ★ Stalling is a SUCCESS for this gripper, not a failure: "closed onto the
+    #   object and stopped" is the desired outcome of a grasp. Allow it, and
+    #   treat "not moving slowly enough" as stalled once the goal tolerance is
+    #   met.
+    allow_stalling: true
+    stall_velocity_threshold: 0.001
+    stall_goal_tolerance: 0.008
+
+    # Effort ceiling (N.m) used only by the controller's own stall detection —
+    # it does NOT command torque. The real torque budget is enforced inside the
+    # SDK (torque_limit_nm in the URDF parameters), because it is allocated
+    # between the position gains per frame rather than sent as a value.
+    # ⚠ Keep it consistent with torque_limit_nm.
+    max_effort: 3.5

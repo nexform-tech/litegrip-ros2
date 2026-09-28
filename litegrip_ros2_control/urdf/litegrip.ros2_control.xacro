@@ -1,0 +1,189 @@
+<?xml version="1.0"?>
+<!--
+  litegrip.ros2_control.xacro — the ros2_control hardware interface declaration
+  for the LiteGrip gripper.
+
+  This file is a declaration only: no kinematics and no geometry. The gripper's
+  link / joint / mimic come from the description package. Usage:
+
+      <xacro:include filename="$(find litegrip_ros2_control)/urdf/litegrip.ros2_control.xacro"/>
+
+  Why a plugin rather than a bundled node plus topics
+  ==================================================
+  The gripper is thereby a ros2_control hardware component: it is loaded,
+  activated and deactivated by controller_manager together with the arm, its
+  joint shows up in /joint_states, and controllers claim its position interface
+  directly. The layer above does not have to invent a topic protocol plus a
+  bridging node of its own.
+
+  Interface surface (decided by the user on 2026-09-23)
+  ====================================================
+    command: position only (DM MIT position control underneath)
+    state:   position / velocity / effort, plus diagnostics
+
+  The trajectory rate ceiling and the torque budget are NOT command interfaces
+  but deployment parameters of this component (see config/litegrip_hw.yaml):
+  they describe how this gripper is allowed to move, so a command publisher must
+  not be able to decide them.
+
+  Where the safety limits live
+  ============================
+  Not here. The red lines are loaded by the SDK from its versioned safety
+  baseline (the safety_baseline parameter below selects the version, or names an
+  explicit file), and this file carries no copy of them. The previous version
+  had red_open_rad / red_close_rad as parameters, which meant two sources of
+  truth for the same safety quantity; that duplication is gone. The plugin asks
+  the SDK which red lines are in effect and derives the commandable opening
+  range from them.
+
+  Conversion parameters (closed_rad / rad_to_mm)
+  =============================================
+  These come from the unit's calibration (factory_calibration.json). The values
+  here are copies of that file and must be kept in sync after a recalibration.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ── calibration (source: factory_calibration.json) ───────────────────── -->
+  <!-- Motor angle at opening = 0 mm, and how many mm one rad is. -->
+  <xacro:arg name="litegrip_closed_rad" default="0.04139"/>
+  <xacro:arg name="litegrip_rad_to_mm" default="65.0231"/>
+  <!-- Model-layer opening range (m), matching the URDF joint limits. -->
+  <xacro:arg name="litegrip_min_width" default="0.0"/>
+  <xacro:arg name="litegrip_max_width" default="0.087"/>
+
+  <!-- ── hardware channel ────────────────────────────────────────────────── -->
+  <!-- Classic CAN (not FD), 1 Mbit/s (bittiming is configured system-side). -->
+  <xacro:arg name="litegrip_channel" default="can0"/>
+  <xacro:arg name="litegrip_can_id" default="8"/>
+  <xacro:arg name="litegrip_mst_id" default="24"/>
+  <xacro:arg name="litegrip_canfd_mode" default="false"/>
+
+  <!-- ── the dual switch (both are required for the real-hardware path) ──── -->
+  <!-- They block two different things: dry_run blocks "do not touch hardware
+       while debugging", hardware_enable blocks "is a gripper actually attached
+       to this machine". Merged into one, reporting the true state would require
+       letting the component drive the motor. The defaults are the safe ones:
+       dry_run up, hardware_enable down. -->
+  <xacro:arg name="litegrip_dry_run" default="true"/>
+  <xacro:arg name="litegrip_hardware_enable" default="false"/>
+
+  <!-- ── control loop ───────────────────────────────────────────────────── -->
+  <!-- DM motors need a continuous MIT frame stream; the SDK's own streaming
+       interface uses 200 Hz. -->
+  <xacro:arg name="litegrip_control_rate_hz" default="200.0"/>
+  <!-- How long without a NEW feedback frame counts as communication loss. -->
+  <xacro:arg name="litegrip_feedback_timeout_s" default="0.5"/>
+  <!-- Temperature ceiling (degC), checked for MOS and coil. This is "stop
+       before the driver trips on its own" — the driver's overtemperature fault
+       is already past that point. -->
+  <xacro:arg name="litegrip_temperature_limit_c" default="80"/>
+  <!-- Stale-command criterion: hold position once no new command frame has
+       arrived for this long. -->
+  <xacro:arg name="litegrip_command_timeout_s" default="0.2"/>
+
+  <!-- ── safety: rate ceiling and torque budget ─────────────────────────── -->
+  <!-- Both can only be turned DOWN, never up (the SDK refuses anything above
+       its hard ceilings). -->
+  <!-- Command trajectory advance rate ceiling (rad/s). It is NOT the velocity
+       setpoint in the MIT frame: the dq field always stays 0, and this value
+       caps how far the target may advance per cycle.
+
+       ⚠ 1.5 is the SDK's hard ceiling, and that ceiling was RAISED from 0.436
+         on request rather than re-derived. To reach it, the SDK's stopping-
+         distance assumptions had to be relaxed too (a_max_rad_s2 5.0 -> 88.0,
+         t_comm_s 0.02 -> 0.010); 1.5 is unreachable at the old values, because
+         the model saturates at (margin - reserve) / t_comm = 1.3897 rad/s.
+         Both assumptions are marked as such in the SDK header. Until they are
+         measured, this ceiling rests on an assumption, not on evidence: raise
+         it only with a measurement behind it.
+
+       It can only be turned DOWN from here, never up. -->
+  <xacro:arg name="litegrip_max_velocity_rad_s" default="1.5"/>
+  <!-- Maximum total control torque allowed for this motion (N.m). It is NOT
+       written into any frame field: it is allocated between the two position
+       gains so that kp*e_b + kd*v_b stays within budget, with e_b / v_b the
+       worst-case bounds. 3.5 is the rated torque of the DM-J4310-2EC. -->
+  <xacro:arg name="litegrip_torque_limit_nm" default="3.5"/>
+  <!-- Versioned safety baseline, or an explicit path to a baseline file. -->
+  <!-- An unknown version or a missing file makes the component REFUSE to
+       start rather than fall back to a default nobody confirmed. -->
+  <xacro:arg name="litegrip_safety_baseline" default="3.5"/>
+
+  <!-- Worst-case position error bound (rad). -1 = derive it from the width of
+       the red lines, which is a real bound because both the target and the
+       reading are forced to stay inside them. -->
+  <xacro:arg name="litegrip_max_position_error_rad" default="-1.0"/>
+
+  <!-- Worst-case feedback velocity bound (rad/s).
+       WARNING: -1 means NOT GIVEN, which means REFUSE TO SEND ANY MOTION
+       FRAME. That is deliberate fail-closed behaviour, not a placeholder: the
+       value must be calibrated on the real hardware (run it through real
+       working conditions, take the peak feedback velocity and add margin)
+       before the gripper will move at all. -->
+  <xacro:arg name="litegrip_max_feedback_velocity_rad_s" default="-1.0"/>
+
+  <!-- MIT gain upper bounds; each frame re-allocates them from the budget. -->
+  <xacro:arg name="litegrip_kp" default="20.0"/>
+  <xacro:arg name="litegrip_kd" default="0.5"/>
+
+  <!-- Export the diagnostic state interfaces (temperature / error_code /
+       fault_code / feedback age). They are not part of the standard trio and
+       joint_state_broadcaster will not claim them; on activation the CM warns
+       that these interfaces are unclaimed, which is expected — set false if it
+       is too noisy. -->
+  <xacro:arg name="litegrip_export_diagnostics" default="true"/>
+
+  <ros2_control name="LitegripSystem" type="system">
+    <hardware>
+      <plugin>litegrip_ros2_control/LitegripSystem</plugin>
+
+      <param name="channel">$(arg litegrip_channel)</param>
+      <param name="can_id">$(arg litegrip_can_id)</param>
+      <param name="mst_id">$(arg litegrip_mst_id)</param>
+      <param name="canfd_mode">$(arg litegrip_canfd_mode)</param>
+
+      <param name="dry_run">$(arg litegrip_dry_run)</param>
+      <param name="hardware_enable">$(arg litegrip_hardware_enable)</param>
+
+      <param name="control_rate_hz">$(arg litegrip_control_rate_hz)</param>
+      <param name="feedback_timeout_s">$(arg litegrip_feedback_timeout_s)</param>
+      <param name="temperature_limit_c">$(arg litegrip_temperature_limit_c)</param>
+      <param name="command_timeout_s">$(arg litegrip_command_timeout_s)</param>
+
+      <param name="max_velocity_rad_s">$(arg litegrip_max_velocity_rad_s)</param>
+      <param name="torque_limit_nm">$(arg litegrip_torque_limit_nm)</param>
+      <param name="safety_baseline">$(arg litegrip_safety_baseline)</param>
+      <param name="max_position_error_rad">$(arg litegrip_max_position_error_rad)</param>
+      <param name="max_feedback_velocity_rad_s">$(arg litegrip_max_feedback_velocity_rad_s)</param>
+
+      <param name="kp">$(arg litegrip_kp)</param>
+      <param name="kd">$(arg litegrip_kd)</param>
+
+      <param name="closed_rad">$(arg litegrip_closed_rad)</param>
+      <param name="rad_to_mm">$(arg litegrip_rad_to_mm)</param>
+      <param name="min_width">$(arg litegrip_min_width)</param>
+      <param name="max_width">$(arg litegrip_max_width)</param>
+
+      <param name="export_diagnostics">$(arg litegrip_export_diagnostics)</param>
+    </hardware>
+
+    <!-- The master joint. The two fingers (gripper_slide_joint_left/right) are
+         its mimic, have no independent command port, and therefore do NOT
+         appear here — a real gripper has only one transmission. The joint name
+         must match the description package's URDF. -->
+    <joint name="gripper_opening_joint">
+      <!-- Only position is exposed for command. -->
+      <command_interface name="position"/>
+      <!-- Feedback like any other joint, plus diagnostics. -->
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <state_interface name="effort"/>
+      <state_interface name="temperature_mos"/>
+      <state_interface name="temperature_coil"/>
+      <state_interface name="error_code"/>
+      <state_interface name="fault_code"/>
+      <state_interface name="feedback_age"/>
+    </joint>
+  </ros2_control>
+
+</robot>

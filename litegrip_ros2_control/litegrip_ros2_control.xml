@@ -1,0 +1,22 @@
+<library path="litegrip_ros2_control">
+  <class
+    name="litegrip_ros2_control/LitegripSystem"
+    type="litegrip_ros2_control::LitegripSystem"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      The ros2_control hardware interface for the LiteGrip gripper (single
+      joint), backed directly by the litegrip_cpp SDK.
+
+      It is a thin shell: the SDK's ControlLoop owns the CAN device, the
+      trajectory rate ceiling, the torque budget, the red-line safety gate and
+      the DM MIT frame stream, on its own thread. This component only parses the
+      URDF parameters, drives the loop's lifecycle, copies the loop's cached
+      state into the state interfaces and posts one converted target per cycle,
+      so read()/write() stay cheap and free of I/O.
+
+      Interface surface: command exposes position only (DM MIT position control
+      underneath); state exposes position/velocity/effort, matching the arm
+      joints, plus diagnostics.
+    </description>
+  </class>
+</library>

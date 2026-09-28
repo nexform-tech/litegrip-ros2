@@ -1,11 +1,12 @@
-# Test gate for a repository that currently ships documentation only.
+# Test gate for the LiteGrip ROS 2 driver.
 #
 # Tests live in their own workflow: they run on pull requests, while the release
 # workflow runs on pushes to the default branch. Mixing the two means a broken
 # release blocks a pull request, or the reverse.
 #
-# Replace the test step with the project's real toolchain and test command as soon
-# as source code lands; see the repository standards in AGENTS.md.
+# The driver links litegrip_cpp, which lives in a separate repository and is not
+# published to any package index, so the build job checks it out into the same
+# workspace and builds it first.
 #
 # AGENTS.md is deliberately not linted: it is canonical content synced from
 # repo-template and must not be edited here.
@@ -25,7 +26,62 @@ concurrency:
   cancel-in-progress: true # a superseded pull request run is pointless
 
 jobs:
+  # The job must be named `test`: that is the required status check.
   test:
+    runs-on: ubuntu-22.04
+    # The driver targets ROS 2 Humble. The base image supplies the ROS 2
+    # libraries and the ament build type; ros2_control is not part of it and
+    # comes in through rosdep below.
+    container: ros:humble-ros-base
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          path: ws/src/litegrip-ros2
+
+      - name: Checkout litegrip_cpp
+        uses: actions/checkout@v4
+        with:
+          repository: nexform-tech/litegrip-cpp
+          path: ws/src/litegrip-cpp
+
+      # Dependencies come from the manifests rather than a hand-written list,
+      # so a new one cannot be forgotten here.
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          # ROS's setup scripts are not nounset-clean, so -u stays off here.
+          set -eo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential python3-colcon-common-extensions python3-rosdep
+          rosdep init 2>/dev/null || true
+          rosdep update
+          source /opt/ros/humble/setup.bash
+          cd ws
+          rosdep install --from-paths src --ignore-src -y
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /opt/ros/humble/setup.bash
+          cd ws
+          colcon build --packages-select litegrip_cpp litegrip_ros2_control
+
+      # The suite runs without hardware: every case drives the component's
+      # lifecycle in-process with a synthetic HardwareInfo, in dry_run, so no
+      # CAN socket is opened.
+      - name: Run Tests
+        shell: bash
+        run: |
+          set -eo pipefail
+          source /opt/ros/humble/setup.bash
+          cd ws
+          colcon test --packages-select litegrip_ros2_control
+          colcon test-result --verbose
+
+  standards:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout Code

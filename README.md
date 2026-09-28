@@ -2,8 +2,11 @@
 
 ROS 2 driver for the **LiteGrip lightweight robotic gripper series**.
 
-> **Status:** repository initialized. Source code, packaging and documentation
-> have not landed yet.
+## Packages
+
+| Package | Type | Role |
+| --- | --- | --- |
+| `litegrip_ros2_control` | ament_cmake | `ros2_control` hardware interface: a C++ `SystemInterface` plugin backed directly by the [litegrip-cpp](https://github.com/nexform-tech/litegrip-cpp) SDK. A thin shell — the SDK's `ControlLoop` owns the CAN device, the trajectory rate ceiling, the torque budget, the red-line safety gate and the DM MIT frame stream, on its own thread |
 
 ## Scope
 
@@ -11,7 +14,7 @@ ROS 2 driver for the **LiteGrip lightweight robotic gripper series**.
 | --- | --- |
 | Product | LiteGrip lightweight robotic gripper series |
 | Repository role | ROS 2 driver |
-| Status | Initializing — no source code yet |
+| Status | Active — ros2_control hardware interface backed by the C++ SDK (no Python daemon, no shared memory) |
 
 ## Related repositories
 
