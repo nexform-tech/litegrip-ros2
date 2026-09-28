@@ -54,7 +54,8 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          set -euo pipefail
+          # ROS's setup scripts are not nounset-clean, so -u stays off here.
+          set -eo pipefail
           source /opt/ros/humble/setup.bash
           cd ws
           colcon build --packages-select litegrip_cpp litegrip_ros2_control
@@ -65,7 +66,8 @@ jobs:
       - name: Run Tests
         shell: bash
         run: |
-          set -euo pipefail
+          # ROS's setup scripts are not nounset-clean, so -u stays off here.
+          set -eo pipefail
           source /opt/ros/humble/setup.bash
           cd ws
           colcon test --packages-select litegrip_ros2_control
