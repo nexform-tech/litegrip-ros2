@@ -86,10 +86,19 @@
        its hard ceilings). -->
   <!-- Command trajectory advance rate ceiling (rad/s). It is NOT the velocity
        setpoint in the MIT frame: the dq field always stays 0, and this value
-       caps how far the target may advance per cycle. The default is the SDK's
-       own ceiling, derived from its stopping-distance model at the packaged
-       baseline; tighten it for real working conditions before a real grasp. -->
-  <xacro:arg name="litegrip_max_velocity_rad_s" default="0.436"/>
+       caps how far the target may advance per cycle.
+
+       ⚠ 1.5 is the SDK's hard ceiling, and that ceiling was RAISED from 0.436
+         on request rather than re-derived. To reach it, the SDK's stopping-
+         distance assumptions had to be relaxed too (a_max_rad_s2 5.0 -> 88.0,
+         t_comm_s 0.02 -> 0.010); 1.5 is unreachable at the old values, because
+         the model saturates at (margin - reserve) / t_comm = 1.3897 rad/s.
+         Both assumptions are marked as such in the SDK header. Until they are
+         measured, this ceiling rests on an assumption, not on evidence: raise
+         it only with a measurement behind it.
+
+       It can only be turned DOWN from here, never up. -->
+  <xacro:arg name="litegrip_max_velocity_rad_s" default="1.5"/>
   <!-- Maximum total control torque allowed for this motion (N.m). It is NOT
        written into any frame field: it is allocated between the two position
        gains so that kp*e_b + kd*v_b stays within budget, with e_b / v_b the
