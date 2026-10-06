@@ -71,7 +71,7 @@ install(TARGETS litegrip_ros2_control
 
 install(DIRECTORY include/ DESTINATION include)
 
-install(DIRECTORY urdf config
+install(DIRECTORY urdf config launch
   DESTINATION share/${PROJECT_NAME}
 )
 

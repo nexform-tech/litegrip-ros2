@@ -28,9 +28,10 @@ memory, no Python, no ctypes layout to keep in sync. `read()` and `write()` touc
 neither CAN nor the allocator — they copy a cached snapshot and post one target,
 so the `controller_manager` cycle stays cheap no matter how the bus is behaving.
 
-**This package cannot move a gripper on its own.** It ships no launch file, no
-URDF geometry and no controller implementation. The sections below state exactly
-what it needs.
+**This package cannot move a gripper on its own.** It ships no URDF geometry, no
+controller implementation and nothing that starts `controller_manager`: the one
+launch file it carries spawns controllers onto a manager that another stack has
+already brought up. The sections below state exactly what it needs.
 
 ## Dependencies
 
@@ -53,7 +54,7 @@ what it needs.
 | `joint_state_broadcaster` | publishes `/joint_states` from the state interfaces, which is what puts the gripper into TF and MoveIt | the gripper joint is invisible outside ros2_control |
 | `gripper_controllers` | provides `position_controllers/GripperActionController`, the type `config/litegrip_controllers.yaml` configures | the shipped controller configuration has no implementation to load |
 | `robot_state_publisher`, `xacro` | expand the URDF that includes `urdf/litegrip.ros2_control.xacro` | the `<ros2_control>` block never reaches `controller_manager` |
-| `launch`, `launch_ros` | a launch file that passes `config/litegrip_controllers.yaml` to `controller_manager` as a params file | the controller configuration has to be passed by hand |
+| `launch`, `launch_ros` | `launch/litegrip_controllers.launch.py`, which spawns the controllers and hands `config/litegrip_controllers.yaml` to them | the controllers have to be spawned by hand |
 
 ### `litegrip_cpp` is a source dependency, not a packaged one
 
@@ -126,8 +127,11 @@ something different:
 - **No geometry.** The joint name (`gripper_opening_joint`), the two fingers and
   their `<mimic>` come from the description package, `litegrip_urdf` (note: the
   package name differs from its directory name, `litegrip_description`).
-- **No launch file.** Deploy through a stack that brings up `controller_manager`
-  — `litegrip_moveit_config` is the one in this organisation.
+- **No `controller_manager` bring-up.** `launch/litegrip_controllers.launch.py`
+  only spawns controllers. The manager itself comes from a stack that owns the
+  description and the hardware component — `litegrip_moveit_config` is the one in
+  this organisation, and the description package's own `ros2_control.launch.py`
+  does it for the mock hardware.
 - **More than one joint is rejected.** A real LiteGrip has a single
   transmission and the two fingers are `<mimic>`, so a `<ros2_control>` block
   that declares two joints fails `on_init` by design.
@@ -247,12 +251,121 @@ loaded when the controllers are spawned — that is, the description file has to
 include the xacro above — or the spawner will not find
 `gripper_opening_joint`'s interfaces.
 
+`launch/litegrip_controllers.launch.py` is that spawning step: it takes the
+controller names and types, hands this package's parameter file to the gripper
+controller, starts the gripper controller after the broadcaster, and prints the
+command to send. See [Commanding the gripper](#commanding-the-gripper).
+
 The shipped controller is `position_controllers/GripperActionController` on the
 single joint, exposing `control_msgs/action/GripperCommand` on
 `/gripper_controller/gripper_cmd` (not `FollowJointTrajectory`). Stalling is
 configured as success, because "closed onto the object and stopped" is the
 desired outcome of a grasp. Anything hard-wired to a trajectory action name must
 be updated.
+
+## Commanding the gripper
+
+Everything below assumes the hardware component is loaded, that is, the URDF that
+`controller_manager` received includes `urdf/litegrip.ros2_control.xacro`. Source the
+workspace first (`source install/setup.bash`).
+
+### Start the controllers
+
+```bash
+ros2 launch litegrip_ros2_control litegrip_controllers.launch.py
+```
+
+The launch spawns `joint_state_broadcaster` first and `gripper_controller` after it, using
+`config/litegrip_controllers.yaml`. Arguments worth knowing:
+
+| Argument | Default | Use it when |
+| --- | --- | --- |
+| `controller_manager` | `/controller_manager` | the manager is namespaced, for example `/arm/controller_manager` |
+| `inactive` | `false` | you want the controllers loaded and configured but not active |
+| `start_joint_state_broadcaster` | `true` | set `false` when another stack already publishes `/joint_states` |
+| `gripper_controller_type` | `position_controllers/GripperActionController` | you replaced the controller type in the YAML |
+
+The same by hand, without the launch file:
+
+```bash
+ros2 run controller_manager spawner joint_state_broadcaster \
+  --controller-manager /controller_manager \
+  --controller-type joint_state_broadcaster/JointStateBroadcaster
+
+ros2 run controller_manager spawner gripper_controller \
+  --controller-manager /controller_manager \
+  --controller-type position_controllers/GripperActionController \
+  --param-file "$(ros2 pkg prefix litegrip_ros2_control)/share/litegrip_ros2_control/config/litegrip_controllers.yaml"
+```
+
+### See what is there
+
+```bash
+ros2 control list_hardware_components     # is the gripper's component active?
+ros2 control list_hardware_interfaces     # gripper_opening_joint/position: exists, claimed?
+ros2 control list_controllers             # joint_state_broadcaster and gripper_controller active?
+```
+
+`ros2 control` comes from `ros2controlcli`, which is not a dependency of this package.
+If the command is missing: `sudo apt install ros-humble-ros2controlcli`.
+
+### Open, close and grasp
+
+The controller is an **action server**, and the opening is in metres: `0.0` is fully
+closed, `0.087` is fully open (the URDF joint limits). The commandable range is narrower,
+because the SDK's red lines bound it and the component clamps to them.
+
+```bash
+# open fully
+ros2 action send_goal /gripper_controller/gripper_cmd \
+  control_msgs/action/GripperCommand "{command: {position: 0.087, max_effort: 3.5}}"
+
+# close fully
+ros2 action send_goal /gripper_controller/gripper_cmd \
+  control_msgs/action/GripperCommand "{command: {position: 0.0, max_effort: 3.5}}"
+
+# grasp something about 40 mm wide, watching feedback
+ros2 action send_goal /gripper_controller/gripper_cmd \
+  control_msgs/action/GripperCommand "{command: {position: 0.040, max_effort: 3.5}}" --feedback
+```
+
+A grasp **succeeds when the fingers stall**: a result with `stalled: true` and
+`reached_goal: false` means the gripper closed onto the object, which is the outcome a
+grasp wants. That comes from `allow_stalling: true` in `config/litegrip_controllers.yaml`.
+
+`max_effort` is **not** a torque command: the controller uses it only for its own stall
+detection, and the real torque budget is `torque_limit_nm` in the URDF, enforced inside
+`litegrip_cpp`. It can only be turned down.
+
+To watch the joint while commanding:
+
+```bash
+ros2 topic echo /joint_states --once
+```
+
+**Do not look for a command topic.** `GripperActionController` has none; a topic form
+(`ros2 topic pub /gripper_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.043]}"`)
+only exists with a `JointGroupPositionController`, which is what the description
+package's mock launch configures.
+
+### Stop or remove the controllers
+
+```bash
+ros2 control switch_controllers --deactivate gripper_controller
+ros2 control unload_controller gripper_controller
+ros2 control switch_controllers --deactivate joint_state_broadcaster
+```
+
+### Before expecting motion on real hardware
+
+Three URDF parameters decide whether a real gripper moves, and each blocks something
+different: `dry_run` (default `true`), `hardware_enable` (default `false`) and
+`max_feedback_velocity_rad_s` (default `-1.0`, meaning *not given*, which refuses to send
+any motion frame). The CAN interface has to be up as well:
+
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+```
 
 ## Testing
 
