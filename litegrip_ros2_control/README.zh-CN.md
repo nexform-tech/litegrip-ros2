@@ -26,8 +26,9 @@ SDK 自己的线程上：单进程、无共享内存、无 Python、也不再有
 布局。`read()` 与 `write()` 既不碰 CAN 也不分配内存 —— 它们只复制一份缓存快照、
 投递一个目标，所以总线状况再差，`controller_manager` 的控制周期依然很便宜。
 
-**本包自己动不了夹爪。** 它不含启动文件、不含 URDF 几何、也不含控制器实现。
-下面逐条说明它需要什么。
+**本包自己动不了夹爪。** 它不含 URDF 几何、不含控制器实现，也不含任何能拉起
+`controller_manager` 的东西：它带的那一个启动文件只是把控制器挂到**别人已经拉起**的
+manager 上。下面逐条说明它需要什么。
 
 ## 依赖关系
 
@@ -50,7 +51,7 @@ SDK 自己的线程上：单进程、无共享内存、无 Python、也不再有
 | `joint_state_broadcaster` | 从状态接口发布 `/joint_states`，夹爪才进入 TF 与 MoveIt | 夹爪关节在 ros2_control 之外不可见 |
 | `gripper_controllers` | 提供 `position_controllers/GripperActionController`，即 `config/litegrip_controllers.yaml` 配置的类型 | 随包控制器配置找不到实现 |
 | `robot_state_publisher`、`xacro` | 展开包含 `urdf/litegrip.ros2_control.xacro` 的 URDF | `<ros2_control>` 段永远到不了 `controller_manager` |
-| `launch`、`launch_ros` | 用启动文件把 `config/litegrip_controllers.yaml` 作为 params 文件传给 `controller_manager` | 控制器配置只能手工传 |
+| `launch`、`launch_ros` | `launch/litegrip_controllers.launch.py`：拉起控制器并把 `config/litegrip_controllers.yaml` 交给它们 | 控制器只能手工 spawn |
 
 ### `litegrip_cpp` 是源码依赖，不是包依赖
 
@@ -111,8 +112,9 @@ fail-closed 的 —— 组件宁可拒绝启动，也不会退回没人确认过
 
 - **没有几何。** 关节名（`gripper_opening_joint`）、两根手指及其 `<mimic>` 都来自
   描述包 `litegrip_urdf`（注意：包名与目录名 `litegrip_description` 不一致）。
-- **没有启动文件。** 要通过一个能拉起 `controller_manager` 的栈来部署，本组织的
-  那一个是 `litegrip_moveit_config`。
+- **不负责拉起 `controller_manager`。** `launch/litegrip_controllers.launch.py`
+  只负责 spawn 控制器；manager 本身来自拥有描述文件与硬件组件的栈 —— 本组织里是
+  `litegrip_moveit_config`，mock 硬件下则由描述包自带的 `ros2_control.launch.py` 拉起。
 - **多关节会被拒绝。** 真爪只有一套传动、两指是 `<mimic>`，所以声明两个关节的
   `<ros2_control>` 段会在 `on_init` 按设计失败。
 
@@ -217,10 +219,117 @@ rad       = closed_rad - 开口 [mm] / rad_to_mm
 控制器配置一起加载。生成控制器时硬件组件必须已经加载 —— 也就是说描述文件必须
 已经包含上面的 xacro —— 否则 spawner 找不到 `gripper_opening_joint` 的接口。
 
+`launch/litegrip_controllers.launch.py` 就是这一步：它接收控制器名与类型，把本包的
+参数文件交给夹爪控制器，在 broadcaster 之后启动夹爪控制器，并打印出可直接拷贝的命令。
+见[控制夹爪](#控制夹爪)。
+
 随包控制器是单关节上的 `position_controllers/GripperActionController`，在
 `/gripper_controller/gripper_cmd` 上提供 `control_msgs/action/GripperCommand`
 （**不是** `FollowJointTrajectory`）。堵转被配置为成功，因为「夹住物体后停住」
 正是抓取想要的结果。任何写死了轨迹 action 名的上层都必须改。
+
+## 控制夹爪
+
+以下命令都假设硬件组件已经加载 —— 也就是 `controller_manager` 收到的 URDF 里包含
+`urdf/litegrip.ros2_control.xacro`。先 source 工作区（`source install/setup.bash`）。
+
+### 启动控制器
+
+```bash
+ros2 launch litegrip_ros2_control litegrip_controllers.launch.py
+```
+
+该启动文件先拉起 `joint_state_broadcaster`，再拉起 `gripper_controller`，使用的配置是
+`config/litegrip_controllers.yaml`。几个值得知道的参数：
+
+| 参数 | 默认值 | 什么时候改 |
+| --- | --- | --- |
+| `controller_manager` | `/controller_manager` | manager 在命名空间下，例如 `/arm/controller_manager` |
+| `inactive` | `false` | 只想加载并 configure，不激活 |
+| `start_joint_state_broadcaster` | `true` | 已有别的栈在发 `/joint_states` 时设为 `false` |
+| `gripper_controller_type` | `position_controllers/GripperActionController` | 你换了 YAML 里的控制器类型 |
+
+不用启动文件时，手工等价命令：
+
+```bash
+ros2 run controller_manager spawner joint_state_broadcaster \
+  --controller-manager /controller_manager \
+  --controller-type joint_state_broadcaster/JointStateBroadcaster
+
+ros2 run controller_manager spawner gripper_controller \
+  --controller-manager /controller_manager \
+  --controller-type position_controllers/GripperActionController \
+  --param-file "$(ros2 pkg prefix litegrip_ros2_control)/share/litegrip_ros2_control/config/litegrip_controllers.yaml"
+```
+
+### 看当前状态
+
+```bash
+ros2 control list_hardware_components     # 夹爪的硬件组件是否 active
+ros2 control list_hardware_interfaces     # gripper_opening_joint/position 是否存在、是否被 claim
+ros2 control list_controllers             # joint_state_broadcaster 与 gripper_controller 是否 active
+```
+
+`ros2 control` 来自 `ros2controlcli`，它不是本包的依赖。命令不存在时：
+`sudo apt install ros-humble-ros2controlcli`。
+
+### 张开、闭合与抓取
+
+控制器是 **action 服务端**，开口单位是米：`0.0` 全闭，`0.087` 全开（URDF 关节限位）。
+可命令范围更窄，因为 SDK 的红线把它限住，组件会按红线钳位。
+
+```bash
+# 全开
+ros2 action send_goal /gripper_controller/gripper_cmd \
+  control_msgs/action/GripperCommand "{command: {position: 0.087, max_effort: 3.5}}"
+
+# 全闭
+ros2 action send_goal /gripper_controller/gripper_cmd \
+  control_msgs/action/GripperCommand "{command: {position: 0.0, max_effort: 3.5}}"
+
+# 抓约 40 mm 宽的物体，并查看 feedback
+ros2 action send_goal /gripper_controller/gripper_cmd \
+  control_msgs/action/GripperCommand "{command: {position: 0.040, max_effort: 3.5}}" --feedback
+```
+
+抓取**以堵转成功**：结果里 `stalled: true`、`reached_goal: false` 表示夹爪夹住物体后停住，
+这正是抓取想要的结果。它来自 `config/litegrip_controllers.yaml` 的 `allow_stalling: true`。
+
+`max_effort` **不是**力矩指令：控制器只用它做自己的堵转判定，真正的力矩预算是 URDF 里的
+`torque_limit_nm`，由 `litegrip_cpp` 内部执行，且只能往小调。
+
+一边下指令一边看关节：
+
+```bash
+ros2 topic echo /joint_states --once
+```
+
+**不要去找命令话题。** `GripperActionController` 没有命令话题；只有当控制器换成
+`JointGroupPositionController` 时才有：
+
+```bash
+ros2 topic pub /gripper_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.043]}"
+```
+
+描述包的 mock 启动文件用的正是后者。
+
+### 停掉或卸载控制器
+
+```bash
+ros2 control switch_controllers --deactivate gripper_controller
+ros2 control unload_controller gripper_controller
+ros2 control switch_controllers --deactivate joint_state_broadcaster
+```
+
+### 真机运动前的三个开关
+
+真爪能不能动由三个 URDF 参数决定，各自拦的不是同一件事：`dry_run`（默认 `true`）、
+`hardware_enable`（默认 `false`）、`max_feedback_velocity_rad_s`（默认 `-1.0`，含义是
+**未给定**，会拒绝发出任何运动帧）。此外 CAN 接口要先起来：
+
+```bash
+sudo ip link set can0 up type can bitrate 1000000
+```
 
 ## 测试
 
