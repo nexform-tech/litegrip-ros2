@@ -124,8 +124,7 @@ something different:
 ### What this package deliberately does not contain
 
 - **No geometry.** The joint name (`gripper_opening_joint`), the two fingers and
-  their `<mimic>` come from the description package, `litegrip_urdf` (note: the
-  package name differs from its directory name, `litegrip_description`).
+  their `<mimic>` come from the description package, `litegrip_description`.
 - **No launch file.** Deploy through a stack that brings up `controller_manager`
   — `litegrip_moveit_config` is the one in this organisation.
 - **More than one joint is rejected.** A real LiteGrip has a single
