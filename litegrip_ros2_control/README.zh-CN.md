@@ -110,7 +110,7 @@ fail-closed 的 —— 组件宁可拒绝启动，也不会退回没人确认过
 ### 本包刻意不含的东西
 
 - **没有几何。** 关节名（`gripper_opening_joint`）、两根手指及其 `<mimic>` 都来自
-  描述包 `litegrip_urdf`（注意：包名与目录名 `litegrip_description` 不一致）。
+  描述包 `litegrip_description`。
 - **没有启动文件。** 要通过一个能拉起 `controller_manager` 的栈来部署，本组织的
   那一个是 `litegrip_moveit_config`。
 - **多关节会被拒绝。** 真爪只有一套传动、两指是 `<mimic>`，所以声明两个关节的
