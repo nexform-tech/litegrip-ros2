@@ -7,9 +7,6 @@
 # The driver links litegrip_cpp, which lives in a separate repository and is not
 # published to any package index, so the build job checks it out into the same
 # workspace and builds it first.
-#
-# AGENTS.md is deliberately not linted: it is canonical content synced from
-# repo-template and must not be edited here.
 name: CI
 
 on:
@@ -99,7 +96,6 @@ jobs:
         run: |
           set -euo pipefail
           test -s README.md
-          test -s AGENTS.md
           test -s LICENSE
           python3 -c "import json; json.load(open('.releaserc.json'))"
           python3 -c "import json; json.load(open('.markdownlint.json'))"
