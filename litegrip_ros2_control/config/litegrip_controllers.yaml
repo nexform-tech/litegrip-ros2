@@ -39,7 +39,7 @@ gripper_controller:
     # How often the controller checks whether the goal was reached.
     action_monitor_rate: 20.0
 
-    # Trajectory/goal tolerance in metres. The opening range is only ~0.087 m,
+    # Trajectory/goal tolerance in metres. The opening range is only ~0.085 m,
     # so these are two orders of magnitude smaller than the arm's radian
     # tolerances: 8 mm is wide enough to tolerate the steady-state droop that
     # calibration and elasticity bring, and tight enough that "did not get

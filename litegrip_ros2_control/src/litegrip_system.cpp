@@ -158,10 +158,10 @@ std::pair<double, double> LitegripSystem::commandable_width_range() const {
 }
 
 double LitegripSystem::width_to_rad(double width) const {
-  // ① Clamp into the **commandable range** first: the model layer's 0~87 mm is
-  //    wider than the red lines permit, and without clamping an ordinary
-  //    "fully open 87 mm" would be rejected whole by the gate and nothing would
-  //    move (see the header for details).
+  // ① Clamp into the **commandable range** first: the model layer's
+  //    0~85.452 mm is wider than the red lines permit, and without clamping an
+  //    ordinary "fully open" command would be rejected whole by the gate and
+  //    nothing would move (see the header for details).
   const auto range = commandable_width_range();
   const double clamped = std::clamp(width, range.first, range.second);
   // ② Then clamp the angle by the red lines (belt and braces: if the conversion

@@ -190,7 +190,7 @@ them without editing the URDF.
 | `max_feedback_velocity_rad_s` | `-1.0` | `-1` means not given, which refuses to send any motion frame |
 | `kp` / `kd` | `20.0` / `0.5` | upper bounds; each frame re-allocates them from the budget |
 | `closed_rad` / `rad_to_mm` | `0.04139` / `65.0231` | this unit's calibration |
-| `min_width` / `max_width` | `0.0` / `0.087` | model-layer opening range in m, matching the URDF joint limits |
+| `min_width` / `max_width` | `0.0` / `0.085452` | model-layer opening range in m, matching the URDF joint limits |
 | `export_diagnostics` | `true` | export the five diagnostic state interfaces |
 
 `dry_run` is not a no-op: the SDK runs the entire control path â€” rate limiting,
@@ -225,12 +225,12 @@ feedback is what decides "stopped or not", so an inverted sign raises no error â
 it quietly makes that decision wrong.
 
 **Do not remove the clamping** in `width_to_rad()`. The model-layer range is
-`0` to `87 mm`, while the commandable range is narrower because the red lines
-bound it, and the SDK **rejects** an out-of-range target rather than clamping it.
-Without clamping here, an ordinary "open fully" command would be dropped whole,
-the gripper would not move, and all that would be left behind is a fault code.
-The commandable range is derived from the red lines the SDK actually loaded
-(`loop_->safety_limits()`), not from a second copy in the URDF.
+`0` to `85.452 mm`, while the commandable range is narrower because the red
+lines bound it, and the SDK **rejects** an out-of-range target rather than
+clamping it. Without clamping here, an ordinary "open fully" command would be
+dropped whole, the gripper would not move, and all that would be left behind is
+a fault code. The commandable range is derived from the red lines the SDK
+actually loaded (`loop_->safety_limits()`), not from a second copy in the URDF.
 
 ## Deploying it
 
