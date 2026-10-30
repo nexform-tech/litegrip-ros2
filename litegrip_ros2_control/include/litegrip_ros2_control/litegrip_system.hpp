@@ -186,7 +186,7 @@ class LitegripSystem : public hardware_interface::SystemInterface {
   double closed_rad_ = 0.04139;  // motor angle at opening = 0
   double rad_to_mm_ = 65.0231;   // mm / rad
   double min_width_ = 0.0;       // model-layer opening lower bound (m)
-  double max_width_ = 0.087;     // model-layer opening upper bound (m)
+  double max_width_ = 0.085452;  // model-layer opening upper bound (m)
 
   std::string joint_name_ = "gripper_opening_joint";
   bool export_diagnostics_ = true;
