@@ -51,12 +51,12 @@
 //
 // ★★ Clamping: still here, and now for a simpler reason
 // -----------------------------------------------------
-//   The URDF joint range is the MODEL layer's 0~87 mm, while the commandable
-//   range is narrower because the red lines bound it. The SDK **rejects** an
-//   out-of-range target (it does not clamp), so without clamping here a
-//   perfectly ordinary "fully open 87 mm" command would be dropped whole, the
-//   gripper would not move at all, and all that would be left behind is a fault
-//   code — a phenomenon that is hard to pin down.
+//   The URDF joint range is the MODEL layer's opening travel, 0~85.452 mm,
+//   while the commandable range is narrower because the red lines bound it.
+//   The SDK **rejects** an out-of-range target (it does not clamp), so without
+//   clamping here a perfectly ordinary "fully open 85.452 mm" command would be
+//   dropped whole, the gripper would not move at all, and all that would be
+//   left behind is a fault code — a phenomenon that is hard to pin down.
 //   ⇒ This layer clamps the target into the **commandable range**, and the red
 //     line remains the SDK's second line of defence.
 //
