@@ -51,12 +51,12 @@
 //
 // ★★ Clamping: still here, and now for a simpler reason
 // -----------------------------------------------------
-//   The URDF joint range is the MODEL layer's 0~87 mm, while the commandable
-//   range is narrower because the red lines bound it. The SDK **rejects** an
-//   out-of-range target (it does not clamp), so without clamping here a
-//   perfectly ordinary "fully open 87 mm" command would be dropped whole, the
-//   gripper would not move at all, and all that would be left behind is a fault
-//   code — a phenomenon that is hard to pin down.
+//   The URDF joint range is the MODEL layer's opening travel, 0~85.452 mm,
+//   while the commandable range is narrower because the red lines bound it.
+//   The SDK **rejects** an out-of-range target (it does not clamp), so without
+//   clamping here a perfectly ordinary "fully open 85.452 mm" command would be
+//   dropped whole, the gripper would not move at all, and all that would be
+//   left behind is a fault code — a phenomenon that is hard to pin down.
 //   ⇒ This layer clamps the target into the **commandable range**, and the red
 //     line remains the SDK's second line of defence.
 //
@@ -186,7 +186,7 @@ class LitegripSystem : public hardware_interface::SystemInterface {
   double closed_rad_ = 0.04139;  // motor angle at opening = 0
   double rad_to_mm_ = 65.0231;   // mm / rad
   double min_width_ = 0.0;       // model-layer opening lower bound (m)
-  double max_width_ = 0.087;     // model-layer opening upper bound (m)
+  double max_width_ = 0.085452;  // model-layer opening upper bound (m)
 
   std::string joint_name_ = "gripper_opening_joint";
   bool export_diagnostics_ = true;

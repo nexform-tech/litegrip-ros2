@@ -268,7 +268,7 @@ TEST(LitegripSystemTest, ActivateIgnoresWhateverTheCommandInterfaceInitiallyHeld
   // The requirement is that the ros2_control layer's target EQUALS the current
   // position, so the initial value is irrelevant. This checks that literally:
   // whatever is in the interface before activation gets overwritten.
-  for (const double preloaded : {0.0, 0.087, -1.0, 42.0}) {
+  for (const double preloaded : {0.0, 0.085452, -1.0, 42.0}) {
     auto system = make_configured(make_info());
     system->export_command_interfaces()[0].set_value(preloaded);
     const double measured_before =

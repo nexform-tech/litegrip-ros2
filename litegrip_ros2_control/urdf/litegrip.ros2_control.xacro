@@ -49,7 +49,7 @@
   <xacro:arg name="litegrip_rad_to_mm" default="65.0231"/>
   <!-- Model-layer opening range (m), matching the URDF joint limits. -->
   <xacro:arg name="litegrip_min_width" default="0.0"/>
-  <xacro:arg name="litegrip_max_width" default="0.087"/>
+  <xacro:arg name="litegrip_max_width" default="0.085452"/>
 
   <!-- ── hardware channel ────────────────────────────────────────────────── -->
   <!-- Classic CAN (not FD), 1 Mbit/s (bittiming is configured system-side). -->
